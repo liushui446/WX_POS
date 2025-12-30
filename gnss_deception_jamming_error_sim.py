@@ -20,6 +20,10 @@ class SimParams:
                                     [115.3, 29.1, 1.0],
                                     [115.1, 29.2, 1.0],
                                     [115.4, 29.0, 1.0]])
+        # self.jammer_pos = np.array([[115.10, 28.90, 0.8],
+        #                             [115.12, 29.12, 1.2],
+        #                             [115.15, 29.18, 1.0],
+        #                             [115.13, 29.02, 0.9]])
         #self.jammer_pos_ecef = np.array([lla_to_ecef(sat[0], sat[1], sat[2]) for sat in self.jammer_pos])
         
         # 目标平台参数（巡航导弹示例）
@@ -30,16 +34,33 @@ class SimParams:
         self.sim_time = 100  # 仿真时长(s)
         self.sampling_freq = 1  # 采样频率(Hz)
         
-        # 欺骗点参数（期望错误定位点）
-        self.deception_pos = np.array([115.26, 29.08, 0.5])  # 欺骗点经纬高(°/km)
-        #self.deception_pos_ecef = np.array([lla_to_ecef(self.deception_pos[0], self.deception_pos[1], self.deception_pos[2])])
+        # 欺骗点序列（引导路径，从起始欺骗点到最终欺骗点）
+        # 格式为 [[lon, lat, h_km], ...]，仿真中会沿该路径平滑移动以引导目标到最终欺骗点
+        # self.deception_points = np.array([
+        #     [115.193, 29.027, 0.5],
+        #     [115.24, 29.08, 0.5],
+        #     [115.28, 29.12, 0.5],
+        #     [115.32, 29.15, 0.5]
+        # ])
+
+        # 兼容字段：最终欺骗点（序列的最后一项）
+        self.deception_pos = [115.32, 29.15, 0.5]
+        #self.deception_pos_ecef = np.array([lla_to_ecef(pt[0], pt[1], pt[2]) for pt in self.deception_points])
         
-        # 卫星参数（模拟4颗GDOP最优卫星，实际可通过星历计算）
+        # 卫星参数（模拟10颗可供筛选的卫星，实际可通过星历计算）
         # 形式： [longitude(°), latitude(°), height(km)]
-        self.satellite_pos = np.array([[120.0, 30.0, 20000],  # 卫星经纬高(经度, 纬度, 高度(km))
-                                       [110.0, 35.0, 20000],
-                                       [130.0, 25.0, 20000],
-                                       [105.0, 28.0, 20000]])
+        self.satellite_pos = np.array([
+            [120.0, 30.0, 20000],  # 卫星经纬高(经度, 纬度, 高度(km))
+            [110.0, 35.0, 20000],
+            [130.0, 25.0, 20000],
+            [105.0, 28.0, 20000],
+            [140.0, 32.0, 20000],
+            [100.0, 22.0, 20000],
+            [125.0, 40.0, 20000],
+            [115.0, 20.0, 20000],
+            [135.0, 27.0, 20000],
+            [95.0, 33.0, 20000]
+        ])
         # 将卫星经纬高转换为 ECEF（米），并保存为新属性 satellite_pos_ecef
         # 注意：lla_to_ecef(lon_deg，lat_deg, h_km) 的参数顺序为 (经度, 纬度, 高度_km)
         # self.satellite_pos_ecef = np.array([lla_to_ecef(sat[0], sat[1], sat[2]) for sat in self.satellite_pos])
@@ -90,6 +111,26 @@ def ecef_to_lla(X, Y, Z):
     N = a / np.sqrt(1 - e2 * np.sin(lat)**2)
     h = (p / np.cos(lat) - N) / 1000.0  # m -> km
     return np.rad2deg(lon), np.rad2deg(lat), h
+
+
+def interpolate_deception_points(deception_points, t, total_steps):
+    """
+    沿着 deception_points 序列做分段线性插值，根据当前时间步 t 返回瞬时欺骗点坐标。
+    t: 当前时刻索引（0..total_steps-1）
+    total_steps: 总时间步数
+    返回一个长度为3的数组 [lon, lat, h_km]
+    """
+    pts = np.asarray(deception_points)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("deception_points 必须为 (N,3) 数组")
+    n = pts.shape[0]
+    if n == 1:
+        return pts[0]
+    s = t / max(1, total_steps - 1)
+    seg_len = 1.0 / (n - 1)
+    idx = min(int(s / seg_len), n - 2)
+    local_s = (s - idx*seg_len) / seg_len
+    return (1 - local_s) * pts[idx] + local_s * pts[idx+1]
 
 
 # ========================= 2. 卫星筛选（GDOP最优组合，ECEF 计算）=========================
@@ -213,8 +254,9 @@ def calculate_deception_delay(jammer_pos, satellite_pos, target_pos, deception_p
     # 时延修正：若存在负值，整体偏移使最小值为0
     delays = np.array(delays)
     min_tau = np.min(delays)
-    if min_tau < 0:
-        delays += -min_tau
+    for num in range(len(delays)):
+        if delays[num] < 0:
+            delays[num] = delays[num] + abs(min_tau)
     return delays
 
 # ========================= 5. 定位误差求解（最小二乘法）=========================
@@ -307,6 +349,9 @@ def main_simulation():
         # 2. 筛选GDOP最优卫星
         optimal_sats = select_optimal_satellites(target_pos, params.satellite_pos, params)
         
+        # 2.1 计算当前时刻的欺骗点（沿着 deception_points 序列平滑移动以引导目标）
+        # current_deception = interpolate_deception_points(params.deception_points, t, time_steps)
+
         # 3. 判定欺骗信号有效性
         if not is_deception_valid(params.jammer_pos, target_pos, optimal_sats, params):
             # 欺骗无效，定位误差为0（或按正常GNSS误差处理）
@@ -315,7 +360,7 @@ def main_simulation():
             error_positions.append(target_pos)
             continue
         
-        # 4. 计算欺骗时延
+        # 4. 计算欺骗时延（使用当前插值得到的欺骗点）
         delays = calculate_deception_delay(params.jammer_pos, optimal_sats, target_pos, 
                                           params.deception_pos, params)
         
@@ -324,7 +369,7 @@ def main_simulation():
         errors.append(pos_error)
         
         # 6. 计算受干扰后的目标位置（真实位置 + 定位误差）
-        error_pos = target_pos + pos_error
+        error_pos = target_pos - pos_error
         error_positions.append(error_pos)
     
     # 转换为numpy数组便于处理
@@ -347,7 +392,14 @@ def visualize_results(true_traj, error_traj, errors, params):
     plt.scatter(params.target_init_pos[0], params.target_init_pos[1], c='k', marker='*', s=200, label='起始点')
     plt.plot(true_traj[:, 0], true_traj[:, 1], 'y-', label='预定轨迹', linewidth=2)
     plt.plot(error_traj[:, 0], error_traj[:, 1], 'b-', label='受干扰轨迹', linewidth=2)
-    plt.scatter(params.deception_pos[0], params.deception_pos[1], c='g', marker='*', s=200, label='欺骗点')
+    # 绘制欺骗路径或单点
+    if hasattr(params, 'deception_points'):
+        dp = np.array(params.deception_points)
+        plt.plot(dp[:, 0], dp[:, 1], 'g--', label='欺骗路径')
+        plt.scatter(dp[:, 0], dp[:, 1], c='g', marker='o', s=80)
+        plt.scatter(dp[-1, 0], dp[-1, 1], c='g', marker='*', s=200, label='最终欺骗点')
+    else:
+        plt.scatter(params.deception_pos[0], params.deception_pos[1], c='g', marker='*', s=200, label='欺骗点')
     plt.xlabel('经度(°)')
     plt.ylabel('纬度(°)')
     plt.legend()
@@ -362,8 +414,14 @@ def visualize_results(true_traj, error_traj, errors, params):
                c='k', marker='*', s=200, )
     ax.plot(true_traj[:, 0], true_traj[:, 1], true_traj[:, 2], 'y-')
     ax.plot(error_traj[:, 0], error_traj[:, 1], error_traj[:, 2], 'b-')
-    ax.scatter(params.deception_pos[0], params.deception_pos[1], params.deception_pos[2], 
-               c='g', marker='*', s=200)
+    if hasattr(params, 'deception_points'):
+        dp = np.array(params.deception_points)
+        ax.plot(dp[:, 0], dp[:, 1], dp[:, 2], 'g--')
+        ax.scatter(dp[:, 0], dp[:, 1], dp[:, 2], c='g', marker='o', s=80)
+        ax.scatter(dp[-1, 0], dp[-1, 1], dp[-1, 2], c='g', marker='*', s=200, label='最终欺骗点')
+    else:
+        ax.scatter(params.deception_pos[0], params.deception_pos[1], params.deception_pos[2], 
+                   c='g', marker='*', s=200)
     ax.set_xlabel('经度(°)')
     ax.set_ylabel('纬度(°)')
     ax.set_zlabel('高度(km)')
