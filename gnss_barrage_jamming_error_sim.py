@@ -29,6 +29,143 @@ sat_az = [30, 120, 210, 300]    # 卫星方位角 (°)
 sat_el = [45, 45, 45, 45]       # 卫星俯仰角 (°)
 user_pos = [0, 0, 0]            # 用户接收机位置 (x,y,z 笛卡尔坐标, m)
 
+# -------------------------- 额外：接收机预定航线与固定基站干扰配置 --------------------------
+# 预定航线（地面笛卡尔坐标，单位：米），航线以折线方式连接各航点
+waypoints = [(0, 0, 10), (1500, 500, 10)]  # 示例航点 (x, y, z)，z 为高度（m）
+traj_total_time = 200  # 总仿真时间 (s)
+traj_dt = 1            # 时间步长 (s)
+
+# 固定基站（干扰源）配置：位置、发射功率、干扰类型、干扰带宽、占空比等
+# type: 'continuous'|'pulsed'|'narrowband'
+jammers = [
+    {'pos': (200, 200), 'P_tx': -10, 'type': 'continuous', 'B_j': 2e6, 'duty': 1.0},
+    {'pos': (800, 100), 'P_tx': -30, 'type': 'pulsed',     'B_j': 1e6, 'duty': 0.2},
+    {'pos': (900, 350), 'P_tx': -20, 'type': 'narrowband', 'B_j': 5e5, 'duty': 1.0},
+    {'pos': (600, 300), 'P_tx': -20, 'type': 'continuous', 'B_j': 2e7, 'duty': 1.0},
+    {'pos': (1000, 250), 'P_tx': -20, 'type': 'continuous', 'B_j': 3e9, 'duty': 1.0}
+]
+
+
+def interpolate_trajectory(waypoints, total_time, dt):
+    """按时间等分插值航点，返回 list of positions (x,y,z) 和 times"""
+    # 计算每段地面距离（仅用 x,y）
+    dist_list = []
+    for i in range(len(waypoints)-1):
+        x0, y0 = waypoints[i][0], waypoints[i][1]
+        x1, y1 = waypoints[i+1][0], waypoints[i+1][1]
+        dist_list.append(math.hypot(x1-x0, y1-y0))
+    total_dist = sum(dist_list)
+    if total_dist == 0:
+        wp = waypoints[0]
+        z = wp[2] if len(wp) > 2 else 0
+        return [(wp[0], wp[1], z)], [0]
+    # 按距离比例分配时间
+    num_steps = int(total_time / dt)
+    positions = []
+    times = []
+    # 累积长度
+    seg_cum = [0]
+    for l in dist_list:
+        seg_cum.append(seg_cum[-1] + l)
+    for step in range(num_steps+1):
+        frac = (step/num_steps) * total_dist
+        # find segment
+        for k in range(len(dist_list)):
+            if seg_cum[k] <= frac <= seg_cum[k+1]:
+                seg_len = dist_list[k]
+                seg_frac = (frac - seg_cum[k]) / seg_len if seg_len>0 else 0
+                x0, y0 = waypoints[k][0], waypoints[k][1]
+                x1, y1 = waypoints[k+1][0], waypoints[k+1][1]
+                x = x0 + seg_frac * (x1 - x0)
+                y = y0 + seg_frac * (y1 - y0)
+                # 插值高度 z（若提供）
+                z0 = waypoints[k][2] if len(waypoints[k]) > 2 else 0
+                z1 = waypoints[k+1][2] if len(waypoints[k+1]) > 2 else 0
+                z = z0 + seg_frac * (z1 - z0)
+                positions.append((x, y, z))
+                times.append(step*dt)
+                break
+    return positions, times
+
+
+def calc_jammer_rx_power(jammer, rx_pos, time):
+    """估算接收位置从单个干扰源接收到的功率（dBm），使用三维距离"""
+    tx = jammer['P_tx']
+    jx, jy = jammer['pos'][0], jammer['pos'][1]
+    jz = jammer.get('alt', 0.0)
+    rx_x, rx_y = rx_pos[0], rx_pos[1]
+    rx_z = rx_pos[2] if len(rx_pos) > 2 else 0.0
+    d = math.sqrt((rx_x - jx)**2 + (rx_y - jy)**2 + (rx_z - jz)**2)
+    d = max(d, 1.0)  # 最小距离1m避免无限大
+    # 简化的自由空间衰减模型（仅参考）
+    path_loss_db = 20 * math.log10(d)
+    P_rx = tx - path_loss_db
+    return P_rx
+
+
+def calc_cn0_with_jammers(C_N0_nom, P_s, jammers, rx_pos, B_n, G_ant, time):
+    """根据多个干扰源在接收位置的贡献计算 C/N0_j"""
+    P_s_lin = 10 ** (P_s / 10)
+    sum_term = 0.0
+    for jammer in jammers:
+        P_rx = calc_jammer_rx_power(jammer, rx_pos, time)
+        # 扣除接收端天线抗干扰增益
+        P_jr = P_rx - G_ant
+        P_jr_lin = 10 ** (P_jr / 10)
+        # 考虑占空比（脉冲干扰）
+        if jammer.get('type') == 'pulsed':
+            duty = jammer.get('duty', 1.0)
+            P_jr_lin *= duty
+        B_j_eff = jammer.get('B_j', B_j)
+        sum_term += (P_jr_lin * B_n) / (P_s_lin * B_j_eff)
+    delta_CN0 = 10 * math.log10(1 + sum_term) if sum_term > 0 else 0.0
+    C_N0_j = C_N0_nom - delta_CN0
+    return C_N0_j, delta_CN0
+
+
+def simulate_trajectory_and_errors():
+    """按预定航线模拟逐时刻定位误差并绘图（将每个插值点赋给 user_pos，用于计算）"""
+    positions, times = interpolate_trajectory(waypoints, traj_total_time, traj_dt)
+    sigma_pos_ts = []
+    c_n0_list = []
+    global user_pos
+    for t, pos in zip(times, positions):
+        # 将当前插值点赋给 user_pos（x,y,z）用于后续计算
+        user_pos = [pos[0], pos[1], pos[2]]
+        C_N0_j, _ = calc_cn0_with_jammers(C_N0_nom, P_s, jammers, pos, Bn, G_ant, t)
+        c_n0_list.append(C_N0_j)
+        sigma_rho = calc_sigma_rho_jamming(C_N0_j, Bn, c, sigma_rho_nom)
+        if sigma_rho == np.inf:
+            sigma_pos_ts.append(np.nan)
+        else:
+            pdop = calc_pdop(sat_az, sat_el, user_pos)
+            sigma_pos_ts.append(pdop * sigma_rho)
+    # 绘制航线与干扰站分布和时间序列
+    fig2 = plt.figure(figsize=(12,5))
+    axA = plt.subplot(1,2,1)
+    xs = [p[0] for p in positions]; ys = [p[1] for p in positions]
+    axA.plot(xs, ys, '-o', label='航线轨迹')
+    for j in jammers:
+        axA.scatter(j['pos'][0], j['pos'][1], s=200, marker='X', label=f"Jammer ({j['type']})")
+    axA.set_xlabel('x (m)'); axA.set_ylabel('y (m)'); axA.set_title('航线与固定基站分布')
+    axA.legend(); axA.grid(True)
+    axB = plt.subplot(1,2,2)
+    axB.plot(times, sigma_pos_ts, '-r', marker='o', label='定位误差 σ_pos (m)')
+    axB.set_xlabel('时间 (s)'); axB.set_ylabel('三维定位误差 σ_pos (m)')
+    axB.set_title('定位误差随时间变化')
+    axB.grid(True)
+    # 右轴显示 C/N0
+    axBc = axB.twinx()
+    axBc.plot(times, c_n0_list, '--b', label='C/N0 (dB-Hz)')
+    axBc.axhline(y=C_N0_th, color='gray', linestyle='--', alpha=0.7)
+    axBc.set_ylabel('C/N0 (dB-Hz)')
+    # 合并图例
+    lines, labels = axB.get_legend_handles_labels()
+    lines2, labels2 = axBc.get_legend_handles_labels()
+    axB.legend(lines + lines2, labels + labels2, loc='upper right')
+    plt.tight_layout()
+    plt.show()
+
 # -------------------------- 2. 载噪比衰减与干扰后载噪比计算 --------------------------
 def calc_cn0_jamming(C_N0_nom, P_s, P_j, B_n, B_j, G_ant):
     """计算干扰后的载噪比 C/N0_j"""
@@ -76,155 +213,89 @@ def calc_pdop(sat_az, sat_el, user_pos):
 
 # -------------------------- 5. 定位误差计算主函数 --------------------------
 def calc_position_error():
-    # 步骤1: 计算干扰后载噪比
-    C_N0_j, delta_CN0 = calc_cn0_jamming(C_N0_nom, P_s, P_j, Bn, B_j, G_ant)
-    print(f"干扰后载噪比: {C_N0_j:.2f} dB-Hz")
-    print(f"载噪比衰减量: {delta_CN0:.2f} dB")
+    """按预定航线逐时刻计算定位误差，并保存时间序列供可视化使用"""
+    global traj_positions, traj_times, traj_sigma_pos, traj_c_n0
+    traj_positions, traj_times = interpolate_trajectory(waypoints, traj_total_time, traj_dt)
+    traj_sigma_pos = []
+    traj_c_n0 = []
 
-    # 步骤2: 计算伪距误差
-    sigma_rho_total = calc_sigma_rho_jamming(C_N0_j, Bn, c, sigma_rho_nom)
-    if sigma_rho_total == np.inf:
-        print("部分卫星信号失锁，无法定位")
-        return
-    print(f"总伪距误差: {sigma_rho_total:.4f} m")
+    lost_count = 0
+    for t, pos in zip(traj_times, traj_positions):
+        # 将当前插值点赋给 user_pos
+        global user_pos
+        user_pos = [pos[0], pos[1], pos[2]]
+        # 计算当前时刻的 C/N0
+        C_N0_j, delta = calc_cn0_with_jammers(C_N0_nom, P_s, jammers, user_pos, Bn, G_ant, t)
+        traj_c_n0.append(C_N0_j)
+        # 计算伪距误差
+        sigma_rho = calc_sigma_rho_jamming(C_N0_j, Bn, c, sigma_rho_nom)
+        if sigma_rho == np.inf:
+            traj_sigma_pos.append(np.nan)
+            lost_count += 1
+        else:
+            pdop = calc_pdop(sat_az, sat_el, user_pos)
+            traj_sigma_pos.append(pdop * sigma_rho)
 
-    # 步骤3: 计算 PDOP
-    pdop = calc_pdop(sat_az, sat_el, user_pos)
-    print(f"PDOP 值: {pdop:.2f}")
+    # 打印摘要信息
+    print(f"逐时刻仿真完成，总时刻数: {len(traj_times)}，失锁时刻数: {lost_count}")
+    if np.nansum(traj_sigma_pos) == 0:
+        print("注意：所有时刻均失锁或定位误差无效。")
+    else:
+        valid = np.array([v for v in traj_sigma_pos if not np.isnan(v)])
+        print(f"最大定位误差: {np.nanmax(traj_sigma_pos):.3f} m，平均有效定位误差: {np.nanmean(valid):.3f} m")
 
-    # 步骤4: 计算三维定位误差
-    sigma_pos = pdop * sigma_rho_total
-    print(f"干扰下三维定位误差: {sigma_pos:.4f} m")
-    return sigma_pos
+    return traj_times, traj_positions, traj_sigma_pos, traj_c_n0
 
 # -------------------------- 6. 可视化分析函数 --------------------------
 def visualize_jamming_analysis():
-    """绘制干扰影响的多维度分析图"""
-    
-    # 数据采样范围
-    P_j_range = np.linspace(-120, -80, 30)  # 干扰功率范围 (dBm)
-    C_N0_j_list = []
-    sigma_rho_list = []
-    sigma_pos_list = []
-    
-    for pj in P_j_range:
-        C_N0_j, _ = calc_cn0_jamming(C_N0_nom, P_s, pj, Bn, B_j, G_ant)
-        sigma_rho = calc_sigma_rho_jamming(C_N0_j, Bn, c, sigma_rho_nom)
-        pdop = calc_pdop(sat_az, sat_el, user_pos)
-        
-        C_N0_j_list.append(C_N0_j)
-        sigma_rho_list.append(sigma_rho if sigma_rho != np.inf else np.nan)
-        sigma_pos_list.append(pdop * sigma_rho if sigma_rho != np.inf else np.nan)
-    
-    # 创建子图布局
-    fig = plt.figure(figsize=(15, 10))
-    
-    # 子图1: 干扰功率 vs 载噪比
-    ax1 = plt.subplot(2, 3, 1)
-    ax1.plot(P_j_range, C_N0_j_list, 'b-', linewidth=2, marker='o', markersize=4)
-    ax1.axhline(y=C_N0_th, color='r', linestyle='--', label='失锁阈值')
-    ax1.axhline(y=C_N0_nom, color='g', linestyle='--', label='标称值')
-    ax1.set_xlabel('干扰功率 (dBm)', fontsize=11)
-    ax1.set_ylabel('载噪比 C/N₀ (dB-Hz)', fontsize=11)
-    ax1.set_title('干扰功率 vs 载噪比', fontsize=12, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    
-    # 子图2: 干扰功率 vs 伪距误差
-    ax2 = plt.subplot(2, 3, 2)
-    ax2.semilogy(P_j_range, sigma_rho_list, 'g-', linewidth=2, marker='s', markersize=4)
-    ax2.axhline(y=sigma_rho_nom, color='orange', linestyle='--', label='基线误差')
-    ax2.set_xlabel('干扰功率 (dBm)', fontsize=11)
-    ax2.set_ylabel('伪距误差 σ_ρ (m)', fontsize=11)
-    ax2.set_title('干扰功率 vs 伪距误差', fontsize=12, fontweight='bold')
-    ax2.grid(True, alpha=0.3, which='both')
-    ax2.legend()
-    
-    # 子图3: 干扰功率 vs 三维定位误差
-    ax3 = plt.subplot(2, 3, 3)
-    ax3.semilogy(P_j_range, sigma_pos_list, 'r-', linewidth=2, marker='^', markersize=4)
-    ax3.set_xlabel('干扰功率 (dBm)', fontsize=11)
-    ax3.set_ylabel('定位误差 σ_pos (m)', fontsize=11)
-    ax3.set_title('干扰功率 vs 三维定位误差', fontsize=12, fontweight='bold')
-    ax3.grid(True, alpha=0.3, which='both')
-    
-    # 子图4: 卫星几何配置（极坐标）
-    ax4 = plt.subplot(2, 3, 4, projection='polar')
-    az_rad = [math.radians(az) for az in sat_az]
-    el_rad = [math.radians(el) for el in sat_el]
-    r = [90 - el for el in sat_el]  # 转换为天顶角
-    
-    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A']
-    for i, (az, r_val) in enumerate(zip(az_rad, r)):
-        ax4.scatter(az, r_val, s=300, c=colors[i], marker='*', edgecolors='black', linewidth=1.5)
-        ax4.text(az, r_val + 5, f'Sat{i+1}', ha='center', fontsize=10, fontweight='bold')
-    
-    ax4.set_ylim(0, 90)
-    ax4.set_yticks([0, 30, 60, 90])
-    ax4.set_yticklabels(['90°', '60°', '30°', '0°'])
-    ax4.set_theta_zero_location('N')
-    ax4.set_theta_direction(-1)
-    ax4.set_title('卫星几何配置（天顶图）', fontsize=12, fontweight='bold', pad=20)
-    ax4.grid(True)
-    
-    # 子图5: 参数对比表格
-    ax5 = plt.subplot(2, 3, 5)
-    ax5.axis('off')
-    
-    C_N0_j_final, delta_CN0_final = calc_cn0_jamming(C_N0_nom, P_s, P_j, Bn, B_j, G_ant)
-    sigma_rho_final = calc_sigma_rho_jamming(C_N0_j_final, Bn, c, sigma_rho_nom)
-    pdop_final = calc_pdop(sat_az, sat_el, user_pos)
-    sigma_pos_final = pdop_final * sigma_rho_final
-    
-    table_data = [
-        ['参数', '数值', '单位'],
-        ['标称载噪比', f'{C_N0_nom:.1f}', 'dB-Hz'],
-        ['干扰后载噪比', f'{C_N0_j_final:.2f}', 'dB-Hz'],
-        ['衰减量', f'{delta_CN0_final:.2f}', 'dB'],
-        ['伪距误差', f'{sigma_rho_final:.4f}', 'm'],
-        ['PDOP值', f'{pdop_final:.2f}', '—'],
-        ['定位误差', f'{sigma_pos_final:.4f}', 'm'],
-        ['干扰功率', f'{P_j}', 'dBm'],
-        ['信号功率', f'{P_s}', 'dBm'],
-    ]
-    
-    table = ax5.table(cellText=table_data, cellLoc='center', loc='center',
-                      colWidths=[0.35, 0.35, 0.25])
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 2)
-    
-    # 表头样式
-    for i in range(3):
-        table[(0, i)].set_facecolor('#4ECDC4')
-        table[(0, i)].set_text_props(weight='bold', color='white')
-    
-    # 交替行颜色
-    for i in range(1, len(table_data)):
-        for j in range(3):
-            if i % 2 == 0:
-                table[(i, j)].set_facecolor('#F0F0F0')
-            else:
-                table[(i, j)].set_facecolor('#FFFFFF')
-    
-    ax5.set_title('仿真参数摘要', fontsize=12, fontweight='bold', pad=10)
-    
-    # 子图6: 误差趋势统计
-    ax6 = plt.subplot(2, 3, 6)
-    
-    # 统计误差增长倍数
-    sigma_rho_no_jam = sigma_rho_nom  # 无干扰伪距误差
-    rho_increase = np.array(sigma_rho_list) / sigma_rho_no_jam
-    
-    ax6.fill_between(range(len(rho_increase)), 1, rho_increase, alpha=0.3, color='red')
-    ax6.plot(range(len(rho_increase)), rho_increase, 'r-', linewidth=2.5, marker='o', markersize=5)
-    ax6.axhline(y=1, color='g', linestyle='--', label='无干扰基线', linewidth=1.5)
-    ax6.set_xlabel('干扰功率等级', fontsize=11)
-    ax6.set_ylabel('误差增长倍数', fontsize=11)
-    ax6.set_title('伪距误差增长倍数', fontsize=12, fontweight='bold')
-    ax6.grid(True, alpha=0.3)
-    ax6.legend()
-    
+    """仅绘制：航线地图（含干扰站）与三维定位误差随时间曲线（含 C/N0）"""
+    # 需要先运行 calc_position_error() 来填充 traj_* 全局变量
+    try:
+        times = traj_times
+        positions = traj_positions
+        sigma_pos_ts = traj_sigma_pos
+        c_n0_list = traj_c_n0
+    except NameError:
+        positions, times = interpolate_trajectory(waypoints, traj_total_time, traj_dt)
+        # 若未运行 calc_position_error，则快速计算简单版本
+        sigma_pos_ts = []
+        c_n0_list = []
+        for t, pos in zip(times, positions):
+            C_N0_j, _ = calc_cn0_with_jammers(C_N0_nom, P_s, jammers, pos, Bn, G_ant, t)
+            c_n0_list.append(C_N0_j)
+            sigma_rho = calc_sigma_rho_jamming(C_N0_j, Bn, c, sigma_rho_nom)
+            sigma_pos_ts.append(np.nan if sigma_rho == np.inf else calc_pdop(sat_az, sat_el, pos) * sigma_rho)
+
+    # 绘制图形
+    fig = plt.figure(figsize=(12, 5))
+    ax1 = plt.subplot(1, 2, 1)
+    true_traj = np.array(positions)
+    ax1.plot(true_traj[:, 0], true_traj[:, 1], 'y-', label='预定轨迹', linewidth=2)
+    ax1.scatter([w[0] for w in waypoints], [w[1] for w in waypoints], c='blue', s=30, marker='.', label='航点')
+    shown = set()
+    for j in jammers:
+        key = j['type']
+        label = f"Jammer ({j['type']})" if key not in shown else None
+        ax1.scatter(j['pos'][0], j['pos'][1], s=150, marker='X', label=label)
+        shown.add(key)
+    ax1.scatter(user_pos[0], user_pos[1], c='k', s=50, marker='*', label='接收机当前位置')
+    ax1.set_xlabel('x (m)'); ax1.set_ylabel('y (m)'); ax1.set_title('航线地图与干扰站分布')
+    ax1.legend(); ax1.grid(True)
+
+    ax2 = plt.subplot(1, 2, 2)
+    ax2.plot(times, sigma_pos_ts, '-r', marker='o', label='定位误差 σ_pos (m)')
+    ax2.set_xlabel('时间 (s)'); ax2.set_ylabel('定位误差 σ_pos (m)')
+    ax2.set_title('定位误差随时间变化')
+    ax2.grid(True)
+    ax2b = ax2.twinx()
+    ax2b.plot(times, c_n0_list, '--b', label='C/N0 (dB-Hz)')
+    ax2b.axhline(y=C_N0_th, color='gray', linestyle='--', alpha=0.7)
+    ax2b.set_ylabel('C/N0 (dB-Hz)')
+    # 合并图例
+    lines, labels = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2b.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc='upper right')
+
     plt.tight_layout()
     plt.show()
 
@@ -271,7 +342,8 @@ def export_analysis_report():
 # 运行仿真 --------------------------
 if __name__ == "__main__":
     print("正在执行GNSS干扰定位误差仿真...")
-    sigma_pos = calc_position_error()
-    export_analysis_report()
+    # 在主流程中使用按时序的航线仿真计算
+    times, positions, sigma_pos_ts, c_n0 = calc_position_error()
+    # export_analysis_report()
     print("生成可视化分析图表...")
     visualize_jamming_analysis()
