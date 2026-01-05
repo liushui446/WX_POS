@@ -1,6 +1,7 @@
 import math
 import numpy as np
 from scipy.linalg import inv
+from scipy import integrate
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 
@@ -14,15 +15,29 @@ C_N0_nom = 45  # 标称载噪比 (dB-Hz)
 C_N0_th = 28   # 接收机跟踪阈值载噪比 (dB-Hz)
 c = 3e8        # 光速 (m/s)
 
+signal_type = "CA_code"  # CA_code/P_code/M_code
+Tc = 0.9775e-6  # C/A码码元宽度(s)，P码：0.09775e-6，M码：0.1e-6
+fs = 1.023e6  # M码副载频(Hz)，仅M码使用
+
 # 接收机参数
 Bn = 2.046e6   # 噪声带宽 (Hz, GPS L1 频段)
 sigma_rho_nom = 0.2  # 标称伪距基线误差 (m)
 G_ant = 10     # 抗干扰波束成形增益 (dB)
 
+jam_type = "continuous_wave"  # continuous_wave/bandlimited_gaussian/pulse
+fj = 1575.42e6  # 干扰中心频率(Hz，GPS L1频段)
+beta = 20e6  # 干扰带宽(Hz)，带限高斯干扰用
+tau = 10e-6  # 脉冲宽度(s)，脉冲干扰用
+T = 1e-3  # 脉冲周期(s)，脉冲干扰用
+
 # 干扰参数
 P_j = -100     # 干扰功率 (dBm)
 P_s = -130     # 卫星信号功率 (dBm)
 B_j = 2e6      # 干扰带宽 (Hz, 窄带干扰)
+
+# 积分项参数
+d = 1  # 码跟踪误差系数(1或1/8)
+integral_range = (-beta/2, beta/2)  # 积分范围（-β/2 ~ β/2）
 
 # 卫星几何参数 (示例: 4颗卫星的方位角/俯仰角，实际需从星历获取)
 sat_az = [30, 120, 210, 300]    # 卫星方位角 (°)
@@ -45,6 +60,99 @@ jammers = [
     {'pos': (1000, 250), 'P_tx': -20, 'type': 'continuous', 'B_j': 3e9, 'duty': 1.0}
 ]
 
+
+# ========================= 卫星信号功率谱密度G_S(f)计算 =========================
+def calc_GS(f, params):
+    """计算卫星信号功率谱密度G_S(f)（文档公式5）"""
+    if params.signal_type in ["CA_code", "P_code"]:
+        # C/A码/P码：G_S(f) = Tc·sinc²(πfTc)
+        return params.Tc * (np.sinc(np.pi * f * params.Tc)) ** 2
+    elif params.signal_type == "M_code":
+        # M码：G_S(f) = Tm·sinc²(πfTm)·tan²(πf/(2fs))
+        tan_term = np.tan(np.pi * f / (2 * params.fs)) if (2 * params.fs) != 0 else 0
+        return params.Tc * (np.sinc(np.pi * f * params.Tc)) ** 2 * (tan_term ** 2)
+    else:
+        return 0
+
+# ========================= 干扰信号功率谱密度G_J(f)计算 =========================
+def calc_GJ(f, params):
+    """计算干扰信号功率谱密度G_J(f)（文档公式4）"""
+    if params.jam_type == "continuous_wave":
+        # 连续波干扰：G_J(f) = δ(f - fj)（数值仿真用窄脉冲近似）
+        delta = 1e9 if abs(f - params.fj) < 1e3 else 0  # 1e3Hz带宽近似δ函数
+        return delta
+    elif params.jam_type == "bandlimited_gaussian":
+        # 带限高斯干扰：G_J(f) = 1/β
+        return 1 / params.beta if abs(f) <= params.beta/2 else 0
+    elif params.jam_type == "pulse":
+        # 脉冲干扰：G_J(f) = |(τ/T)·ΣSa[(f-fj)πτ]·δ(f-fj + n/T)|²
+        n = round((f - params.fj) * params.T)
+        sa_term = np.sinc((f - params.fj) * params.tau)
+        return (params.tau / params.T) * (sa_term ** 2) if abs(f - params.fj) <= params.beta/2 else 0
+    else:
+        return 0
+
+# ========================= 4个核心积分项求解函数 =========================
+def integral_term1(params):
+    """积分项1：∫G_J(f)G_S(f)·sin²(πf d Tc) df"""
+    def integrand(f):
+        GJ = calc_GJ(f, params)
+        GS = calc_GS(f, params)
+        sin_term = np.sin(np.pi * f * params.d * params.Tc) ** 2
+        return GJ * GS * sin_term
+    result, _ = integrate.quad(integrand, params.integral_range[0], params.integral_range[1])
+    return result
+
+def integral_term2(params):
+    """积分项2：∫f·G_S(f)·sin(πf d Tc) df"""
+    def integrand(f):
+        GS = calc_GS(f, params)
+        sin_term = np.sin(np.pi * f * params.d * params.Tc)
+        return f * GS * sin_term
+    result, _ = integrate.quad(integrand, params.integral_range[0], params.integral_range[1])
+    return result
+
+def integral_term3(params):
+    """积分项3：∫G_J(f)G_S(f)·cos²(πf d Tc) df"""
+    def integrand(f):
+        GJ = calc_GJ(f, params)
+        GS = calc_GS(f, params)
+        cos_term = np.cos(np.pi * f * params.d * params.Tc) ** 2
+        return GJ * GS * cos_term
+    result, _ = integrate.quad(integrand, params.integral_range[0], params.integral_range[1])
+    return result
+
+def integral_term4(params):
+    """积分项4：∫G_S(f)·cos(πf d Tc) df"""
+    def integrand(f):
+        GS = calc_GS(f, params)
+        cos_term = np.cos(np.pi * f * params.d * params.Tc)
+        return GS * cos_term
+    result, _ = integrate.quad(integrand, params.integral_range[0], params.integral_range[1])
+    return result
+
+# ========================= 集成调用函数（一键求解所有积分项） =========================
+def solve_all_integrals(params):
+    """求解4个核心积分项，返回结果字典"""
+    integrals = {
+        "term1": integral_term1(params),
+        "term2": integral_term2(params),
+        "term3": integral_term3(params),
+        "term4": integral_term4(params)
+    }
+    # 输出验证信息（交叉验证：term1 + term3 ≈ ∫GJ·GS df）
+    def verify_integral():
+        def integrand(f):
+            return calc_GJ(f, params) * calc_GS(f, params)
+        total, _ = integrate.quad(integrand, params.integral_range[0], params.integral_range[1])
+        return abs(integrals["term1"] + integrals["term3"] - total) < 1e-6
+    
+    print(f"积分项求解完成，验证结果：{'通过' if verify_integral() else '失败'}")
+    print(f"积分项1（sin²项）：{integrals['term1']:.6e}")
+    print(f"积分项2（f·sin项）：{integrals['term2']:.6e}")
+    print(f"积分项3（cos²项）：{integrals['term3']:.6e}")
+    print(f"积分项4（cos项）：{integrals['term4']:.6e}")
+    return integrals
 
 def interpolate_trajectory(waypoints, total_time, dt):
     """按时间等分插值航点，返回 list of positions (x,y,z) 和 times"""
