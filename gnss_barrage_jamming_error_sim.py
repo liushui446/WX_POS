@@ -15,12 +15,13 @@ class SimParams:
         # 卫星与星座参数
         self.C_N0_nom = 45  # 标称载噪比 (dB-Hz)
         self.C_N0_th = 28   # 接收机跟踪阈值载噪比 (dB-Hz)
-        self.c = 3e8        # 光速 (m/s)
+        self.c_light = 3e8        # 光速 (m/s)
 
         self.signal_type = "CA_code"  # CA_code/P_code/M_code
         self.Tc = 0.9775e-6  # C/A码码元宽度(s)，P码：0.09775e-6，M码：0.1e-6
         self.fs = 1.023e6  # M码副载频(Hz)，仅M码使用
         self.C = 1e-16  # 卫星信号载波功率(W)
+        self.sat_carrier_power = self.C  # 兼容 calc_cnr 函数命名
 
         # 接收机参数
         self.Bn = 2.046e6   # 噪声带宽 (Hz, GPS L1 频段)
@@ -29,8 +30,15 @@ class SimParams:
 
         self.jam_type = "continuous_wave"  # continuous_wave/bandlimited_gaussian/pulse
         self.fj = 1575.42e6  # 干扰中心频率(Hz，GPS L1频段)
-        self.beta = 20e6  # 干扰带宽(Hz)，带限高斯干扰用
+        self.beta_r = 20e6  # 接收机前端等效预相关带宽  [0.5e6, 1e6, 2e6, 5e6, 10e6]
+        self.fc = self.fj  # 兼容 sim.py 的命名（中心频率）
         self.tau = 10e-6  # 脉冲宽度(s)，脉冲干扰用
+        self.Bp = 18  # PLL 带宽(Hz)
+        self.Bd = self.Bp  # DLL 带宽(Hz)
+        self.Td = 0.02  # 相关积分时间(s)
+
+        # 连续波窄带近似带宽（Hz），用于将 δ 函数近似为窄带矩形谱
+        self.continuous_bw = 1e4  # 10 kHz 默认值
         self.T = 1e-3  # 脉冲周期(s)，脉冲干扰用
 
         # 干扰参数
@@ -40,12 +48,13 @@ class SimParams:
 
         # 积分项参数
         self.d = 1  # 码跟踪误差系数(1或1/8)
-        self.integral_range = (-self.beta/2, self.beta/2)  # 积分范围（-β/2 ~ β/2）
+        self.integral_range = (-self.beta_r/2, self.beta_r/2)  # 积分范围（-β/2 ~ β/2）
+        self.epsabs = 1e-6  # 积分绝对精度控制
 
         # 5. 失锁阈值
         self.pll_unlock_thresh = 15  # 载波环失锁阈值(°)
-        self.dll_unlock_thresh = self.d / 6  # 码环失锁阈值
-
+        self.dll_unlock_thresh = self.d / 6  # 码环失锁阈值        # 跟踪环带宽与相关积分时间（用于 PLL/DLL 计算）
+        
         # 卫星几何参数 (示例: 4颗卫星的方位角/俯仰角，实际需从星历获取)
         self.sat_az = [30, 120, 210, 300]    # 卫星方位角 (°)
         self.sat_el = [45, 45, 45, 45]       # 卫星俯仰角 (°)
@@ -81,34 +90,34 @@ def calc_jam_power_apm(jammer, target_pos, params):
     :return: 干扰信号接收功率P_J(W)
     """
     jam_pos = jammer['pos']
-    jam_power = jammer.get('power', params.jam_power)
-    # 转换为距离（经纬度转地表距离，简化处理，实际需用WGS84坐标系）
-    lon_diff = (jam_pos[0] - target_pos[0]) * np.pi / 180
-    lat_diff = (jam_pos[1] - target_pos[1]) * np.pi / 180
-    earth_radius = 6371  # 地球半径(km)
-    dist_horizontal = earth_radius * np.sqrt(lon_diff**2 + lat_diff**2)  # 水平距离(km)
-    dist_vertical = abs(jam_pos[2] - target_pos[2])  # 垂直距离(km)
-    dist = np.sqrt(dist_horizontal**2 + dist_vertical**2) * 1000  # 总距离(米)
+    # 假定 pos 单位与轨迹一致（米），并且 P_tx 以 dBm 表示
+    P_tx_dbm = jammer.get('P_tx', params.P_j if hasattr(params, 'P_j') else params.P_j)
+    jam_power_w = 10 ** ((P_tx_dbm - 30) / 10)  # dBm -> W
 
-    # APM模型选择（根据距离和仰角）
-    antenna_elevation = np.arctan2(dist_vertical * 1000, dist_horizontal * 1000) * 180 / np.pi  # 天线仰角(°)
+    jx, jy = jam_pos[0], jam_pos[1]
+    jz = jam_pos[2] if len(jam_pos) > 2 else jammer.get('alt', 0.0)
+    rx_x, rx_y, rx_z = target_pos[0], target_pos[1], target_pos[2]
+
+    # 距离 (m)
+    dist = math.sqrt((rx_x - jx)**2 + (rx_y - jy)**2 + (rx_z - jz)**2)
+    dist = max(dist, 1.0)  # 避免零
+
+    # 天线仰角
+    horiz = math.hypot(rx_x - jx, rx_y - jy)
+    antenna_elevation = math.degrees(math.atan2(abs(rx_z - jz), horiz))
 
     if antenna_elevation > 5 or dist < 5000:
-        # FE模型（平面地球，忽略折射和曲率）
-        loss = (4 * np.pi * dist * params.fc / params.c) ** 2  # 自由空间损耗
+        loss = (4 * math.pi * dist * params.fc / params.c_light) ** 2
     elif dist < 20000:
-        # RO模型（射线光学，考虑折射和曲率）
-        refraction_factor = 1.0003  # 大气折射系数
-        loss = (4 * np.pi * dist * params.fc * refraction_factor / params.c) ** 2
-    elif target_pos[2] * 1000 < 10000:
-        # PE模型（抛物方程，适用于中距离低空）
-        loss = (4 * np.pi * dist * params.fc / params.c) ** 2 * 1.2  # 额外损耗系数
+        refraction_factor = 1.0003
+        loss = (4 * math.pi * dist * params.fc * refraction_factor / params.c_light) ** 2
+    elif rx_z * 1000 < 10000:
+        loss = (4 * math.pi * dist * params.fc / params.c_light) ** 2 * 1.2
     else:
-        # XO模型（扩展光学，适用于高空）
-        loss = (4 * np.pi * dist * params.fc / params.c) ** 2 * 0.8  # 损耗修正
+        loss = (4 * math.pi * dist * params.fc / params.c_light) ** 2 * 0.8
 
-    # 干扰接收功率 = 发射功率 * 天线增益（简化为1） / 路径损耗
-    Pj = jam_power / loss
+    # 干扰接收功率 (W)
+    Pj = jam_power_w / loss
     return Pj
 
 # ========================= 4. 载噪比计算（C/NJ）=========================
@@ -122,7 +131,10 @@ def calc_cnr(Pj, params):
     # 计算积分项：∫GJ(f)GS(f)df（积分范围：-β/2 到 β/2）
     integrand = lambda f: calc_GJ(f, params) * calc_GS(f, params)
     integral_result, _ = integrate.quad(integrand, params.fc - params.beta/2, params.fc + params.beta/2)
-    
+    # 避免除零
+    if integral_result <= 0 or Pj <= 0:
+        return 0
+
     # 载噪比计算（线性值）
     C_NJ_linear = params.sat_carrier_power / (Pj * integral_result)
     # 转换为dB-Hz
@@ -131,18 +143,23 @@ def calc_cnr(Pj, params):
 
 # ========================= 功率谱密度计算 =========================
 def calc_GS(f, params):
-    """计算卫星信号功率谱密度G_S(f) """
+    """计算卫星信号功率谱密度G_S(f)。
+    输入 f 为绝对频率(Hz)，这里将其转换为相对载频的偏移 f_rel = f - fc 后计算基带谱。
+    """
+    f_rel = f - params.fc
     if params.signal_type in ["CA_code", "P_code"]:
-        return params.Tc * (np.sinc(np.pi * f * params.Tc)) ** 2
+        return params.Tc * (np.sinc(np.pi * f_rel * params.Tc)) ** 2
     elif params.signal_type == "M_code":
-        tan_term = np.tan(np.pi * f / (2 * params.fs)) if (2 * params.fs) != 0 else 0
-        return params.Tc * (np.sinc(np.pi * f * params.Tc)) ** 2 * (tan_term ** 2)
+        tan_term = np.tan(np.pi * f_rel / (2 * params.fs)) if (2 * params.fs) != 0 else 0
+        return params.Tc * (np.sinc(np.pi * f_rel * params.Tc)) ** 2 * (tan_term ** 2)
     return 0
 
 def calc_GJ(f, params):
     """计算干扰信号功率谱密度G_J(f) """
     if params.jam_type == "continuous_wave":
-        return 1e9 if abs(f - params.fj) < 1e3 else 0  # 窄脉冲近似δ函数
+        # 将 δ 近似为宽度为 continuous_bw 的矩形功率谱，幅值归一化为 1/带宽
+        bw = getattr(params, 'continuous_bw', 1e3)
+        return (1.0 / bw) if abs(f - params.fj) <= bw/2 else 0
     elif params.jam_type == "bandlimited_gaussian":
         return 1 / params.beta if abs(f) <= params.beta/2 else 0
     elif params.jam_type == "pulse":
@@ -195,7 +212,8 @@ def calc_sigma_PLL(params):
     """计算载波锁相环振荡器颤动σ_J PLL"""
     C_NJ_dB = calc_CNJ(params)
     if C_NJ_dB <= 0:
-        return np.inf  # 载噪比无效，返回无穷大
+        # 载噪比无效，返回失锁指示
+        return np.inf, True, C_NJ_dB
     C_NJ_linear = 10 ** (C_NJ_dB / 10)
     
     # 文档公式：σ_J PLL = (360/(2π)) * sqrt( Bp/(C/NJ) * (1 + 1/(2Td·C/NJ)) )
@@ -228,6 +246,41 @@ def calc_sigma_DLL_NELP(params):
     # 失锁判定
     unlock_flag = sigma_dll > params.dll_unlock_thresh
     return sigma_dll, unlock_flag
+
+# ========================= PDOP计算 =========================
+def calc_pdop(sat_az, sat_el, rx_pos):
+    """计算位置稀释因子PDOP (Position Dilution of Precision)
+    :param sat_az: 卫星方位角列表 (°)
+    :param sat_el: 卫星仰角列表 (°)
+    :param rx_pos: 接收机位置 (x,y,z)
+    :return: PDOP值
+    """
+    # 构建几何矩阵 H
+    H = []
+    for az, el in zip(sat_az, sat_el):
+        az_rad = np.radians(az)
+        el_rad = np.radians(el)
+        # 单位向量：sin(el)*cos(az), sin(el)*sin(az), cos(el), 1
+        h_row = [
+            np.sin(el_rad) * np.cos(az_rad),
+            np.sin(el_rad) * np.sin(az_rad),
+            np.cos(el_rad),
+            1.0
+        ]
+        H.append(h_row)
+    
+    H = np.array(H)
+    
+    # 计算 (H^T H)^(-1)
+    try:
+        HTH = H.T @ H
+        HTH_inv = inv(HTH)
+        # PDOP = sqrt(trace of position components)
+        pdop = np.sqrt(HTH_inv[0, 0] + HTH_inv[1, 1] + HTH_inv[2, 2])
+    except:
+        pdop = np.inf
+    
+    return pdop
 
 # ========================= 集成计算函数（一键输出所有结果）=========================
 def calc_PLL_DLL_errors(params):
@@ -327,94 +380,111 @@ def calc_cn0_with_jammers(params, rx_pos, time):
     return C_N0_j, delta_CN0
 
 # -------------------------- 5. 定位误差计算主函数 --------------------------
-def calc_position_error():
-    # 初始化参数
+# -------------------------- 5. 仿真主流程（sim.py 风格） --------------------------
+
+def main_simulation():
+    """逐时刻按预定航线仿真，使用 SimParams、APM 多源干扰与跟踪环误差判定"""
     params = SimParams()
 
-    """按预定航线逐时刻计算定位误差，并保存时间序列供可视化使用"""
-    global traj_positions, traj_times, traj_sigma_pos, traj_c_n0
-    traj_positions, traj_times = interpolate_trajectory(params.waypoints, params.traj_total_time, params.traj_dt)
-    traj_sigma_pos = []
-    traj_c_n0 = []
+    # 若需要可覆盖默认参数，例如使用当前文件中定义的 waypoints
+    positions, times = interpolate_trajectory(params.waypoints, params.traj_total_time, params.traj_dt)
 
-    lost_count = 0
-    for t, pos in zip(traj_times, traj_positions):
-        # 1.将当前插值点赋给 user_pos
-        global user_pos
-        user_pos = [pos[0], pos[1], pos[2]]
+    traj_true = []
+    traj_err = []
+    cnr_ts = []
+    unlock_ts = []
+    sigma_jpll_ts = []
 
-        # 2. 计算干扰信号接收功率（来自多个干扰源的贡献）
+    for t_idx, (t, pos) in enumerate(zip(times, positions)):
+        rx_pos = np.array([pos[0], pos[1], pos[2]])
+        traj_true.append(rx_pos)
+
+        # 多源干扰功率累加（APM）
         Pj_total = 0.0
         for jammer in params.jammers:
-            Pj_total += calc_jam_power_apm(jammer, user_pos, params)
+            Pj_total += calc_jam_power_apm(jammer, rx_pos, params)
 
-        # 3. 计算载噪比
-        C_NJ_dB = calc_cnr(Pj_total, params)
-        if C_NJ_dB < 30:  # 干扰有效（载噪比低于正常阈值）
-            traj_c_n0.append(C_NJ_dB)
+        # 将多源合成的干扰功率注入到 params 中，以供后续的跟踪环误差计算使用
+        params.Pj = Pj_total
+        # 合成带宽采用最大干扰带宽的近似
+        params.B_j = max([j.get('B_j', params.B_j) for j in params.jammers])
 
-            # 3.计算当前时刻的 PLL 与 DLL 误差
-            results = calc_PLL_DLL_errors(params)
+        # 计算 C/N0 (dB-Hz)
+        cnr = calc_cnr(Pj_total, params)
+        # 若积分项导致 calc_cnr 返回 0（无法积分或模型退化），采用能量比近似并考虑带宽作为回退
+        if (cnr == 0 or cnr <= 0) and Pj_total > 0:
+            B_j_eff = max(getattr(params, 'B_j', 1e6), 1e3)
+            delta_CN0 = 10 * np.log10(1 + (Pj_total * params.Bn) / (params.sat_carrier_power * B_j_eff))
+            cnr = params.C_N0_nom - delta_CN0
+        cnr_ts.append(cnr)
 
-            # 4.判断当前时刻的 载波相位跟踪环路 PLL 或 码跟踪环路 DLL 是否失锁误
-            if results["载波环失锁状态"] == "失锁" or results["码环失锁状态"] == "失锁":
-                params.sigma_rho_ts.append(np.nan)  # 失锁时刻定位误差无效
-                lost_count += 1
-                continue
+        if t_idx < 20:
+            # 增加更多诊断信息：积分项、C/NJ、σ_PLL、σ_DLL 和判定
+            term1 = integral_term1(params)
+            term3 = integral_term3(params)
+            cnj = calc_CNJ(params)
+            sigma_pll, pll_unlock_calc, cnj_dB2 = calc_sigma_PLL(params)
+            sigma_dll, dll_unlock_calc = calc_sigma_DLL_NELP(params)
+            print(f"诊断 t={t} s: Pj_total={Pj_total:.3e} W, C/N0={cnr:.2f} dB-Hz, integral1={term1:.3e}, integral3={term3:.3e}, C/NJ={cnj:.3e}, σ_PLL={sigma_pll:.3f}, σ_DLL={sigma_dll:.3e}, unlock_calc={pll_unlock_calc or dll_unlock_calc}")
 
-            params.sigma_rho_ts.append(results["伪距测量误差"])
+        # 计算跟踪环误差并判定失锁（使用现有函数）
+        sigma_pll, pll_unlock, cnj_dB = calc_sigma_PLL(params)
+        sigma_dll, dll_unlock = calc_sigma_DLL_NELP(params)
 
-    # 打印摘要信息
-    print(f"逐时刻仿真完成，总时刻数: {len(traj_times)}，失锁时刻数: {lost_count}")
-    if np.nansum(params.sigma_rho_ts) == 0:
-        print("注意：所有时刻均失锁或定位误差无效。")
-    else:
-        valid = np.array([v for v in params.sigma_rho_ts if not np.isnan(v)])
-        print(f"最大定位误差: {np.nanmax(params.sigma_rho_ts):.3f} m，平均有效定位误差: {np.nanmean(valid):.3f} m")
-    # export_analysis_report()
-    print("生成可视化分析图表...")
-    visualize_jamming_analysis(params)
+        unlock = pll_unlock or dll_unlock
+        unlock_ts.append(unlock)
+
+        # 如果未失锁，估算定位误差（简化: 用伪距误差近似）
+        if not unlock:
+            # 伪距测量误差（m）
+            sigma_rho = sigma_dll * params.c_light if not np.isinf(sigma_dll) else np.inf
+            # 估算 PDOP
+            pdop = calc_pdop(params.sat_az, params.sat_el, rx_pos)
+            pos_err = pdop * sigma_rho
+        else:
+            pos_err = np.nan
+
+        traj_err.append([pos_err, pdop if not unlock else np.nan])
+        sigma_jpll_ts.append(sigma_pll)
+
+    # 转换为 numpy 数组
+    traj_true = np.array(traj_true)
+    traj_err = np.array(traj_err)
+    cnr_ts = np.array(cnr_ts)
+    unlock_ts = np.array(unlock_ts)
+    sigma_jpll_ts = np.array(sigma_jpll_ts)
+
+    print(f"仿真结束：总时刻={len(times)}, 失锁时刻={np.sum(unlock_ts)}")
+
+    visualize_results(traj_true, traj_err, cnr_ts, unlock_ts, times, sigma_jpll_ts, params)
 
 
-# -------------------------- 6. 可视化分析函数 --------------------------
-def visualize_jamming_analysis(params):
-    """仅绘制：航线地图（含干扰站）与三维定位误差随时间曲线（含 C/N0）"""
-    # 需要先运行 calc_position_error() 来填充 traj_* 全局变量
-    try:
-        times = traj_times
-        positions = traj_positions
-        sigma_pos_ts = traj_sigma_pos
-        c_n0_list = traj_c_n0
-    except NameError:
-        print("请先运行 calc_position_error() 来生成数据！")
-        return
+# 可视化函数（简洁明了）
+def visualize_results(true_traj, err_traj, cnr_ts, unlock_ts, times, sigma_jpll_ts, params):
+    plt.figure(figsize=(12, 5))
 
-    # 绘制图形
-    fig = plt.figure(figsize=(12, 5))
     ax1 = plt.subplot(1, 2, 1)
-    true_traj = np.array(positions)
-    ax1.plot(true_traj[:, 0], true_traj[:, 1], 'y-', label='预定轨迹', linewidth=2)
+    ax1.plot(true_traj[:, 0], true_traj[:, 1], 'y-', linewidth=2, label='航线')
     ax1.scatter([w[0] for w in params.waypoints], [w[1] for w in params.waypoints], c='blue', s=30, marker='.', label='航点')
-    shown = set()
     for j in params.jammers:
-        key = j['type']
-        label = f"Jammer ({j['type']})" if key not in shown else None
-        ax1.scatter(j['pos'][0], j['pos'][1], s=150, marker='X', label=label)
-        shown.add(key)
-    ax1.scatter(user_pos[0], user_pos[1], c='k', s=50, marker='*', label='接收机当前位置')
-    ax1.set_xlabel('x (m)'); ax1.set_ylabel('y (m)'); ax1.set_title('航线地图与干扰站分布')
-    ax1.legend(); ax1.grid(True)
+        ax1.scatter(j['pos'][0], j['pos'][1], c='red', marker='x', s=80, label=f"干扰源:{j.get('type','')}")
+    # 去重图例
+    handles, labels = ax1.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax1.legend(by_label.values(), by_label.keys())
+    ax1.set_title('航线与干扰站分布')
+    ax1.grid(True)
 
     ax2 = plt.subplot(1, 2, 2)
-    ax2.plot(times, params.sigma_pos_ts, '-r', marker='o', label='定位误差 σ_pos (m)')
-    ax2.set_xlabel('时间 (s)'); ax2.set_ylabel('定位误差 σ_pos (m)')
-    ax2.set_title('定位误差随时间变化')
+    ax2.plot(times, err_traj[:, 0], '-r', marker='o', label='估算定位误差 (m)')
+    ax2.set_xlabel('时间 (s)'); ax2.set_ylabel('定位误差 (m)')
     ax2.grid(True)
+
     ax2b = ax2.twinx()
-    ax2b.plot(times, c_n0_list, '--b', label='C/N0 (dB-Hz)')
+    ax2b.plot(times, cnr_ts, '--b', label='C/N0 (dB-Hz)')
+    ax2b.plot(times, sigma_jpll_ts, ':g', label='σ_JPLL (°)')
     ax2b.axhline(y=params.C_N0_th, color='gray', linestyle='--', alpha=0.7)
-    ax2b.set_ylabel('C/N0 (dB-Hz)')
-    # 合并图例
+
     lines, labels = ax2.get_legend_handles_labels()
     lines2, labels2 = ax2b.get_legend_handles_labels()
     ax2.legend(lines + lines2, labels + labels2, loc='upper right')
@@ -422,8 +492,8 @@ def visualize_jamming_analysis(params):
     plt.tight_layout()
     plt.show()
 
+
 # 运行仿真 --------------------------
 if __name__ == "__main__":
-    print("正在执行GNSS干扰定位误差仿真...")
-    # 在主流程中使用按时序的航线仿真计算
-    calc_position_error()
+    print("正在执行GNSS干扰定位误差仿真（sim.py 风格）...")
+    main_simulation()
