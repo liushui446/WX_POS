@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import integrate
@@ -13,15 +14,39 @@ class SimParams:
         self.c = 3e8  # 光速(m/s)
         self.Td = 0.02  # 相关积分时间(s)
         self.fc = 1575.42e6  # GNSS中心频率(GPS L1频段, Hz)
+
+        # 目标平台参数（巡航导弹示例）
+        self.target_init_pos = np.array([119.045, 27.2233, 1.3])  # 初始经纬高(°/km)
+        self.target_velocity = np.array([0.0005, 0.0003, 0])  # 速度(°/s, °/s, km/s)
+        self.sim_time = 200  # 仿真时长(s)
+        self.sampling_freq = 1  # 采样频率(Hz)
         
-        # 干扰装备参数
+        # 干扰装备参数（保留单源参数作为默认，同时支持多个干扰源列表）
         self.jam_type = "multi-tone"  # 干扰样式：continuous_wave/multi-tone/bandlimited_gaussian/pulse
-        self.jam_power = 50  # 干扰发射功率(W)
+        self.jam_power = 50  # 单个干扰源发射功率(W)（默认）
         self.jam_bandwidth = 20e6  # 干扰带宽(Hz)
-        self.jam_pos = np.array([119.045, 27.2233, 0.5])  # 干扰源经纬高(°/km)
         self.pulse_width = 10e-6  # 脉冲宽度(s)，仅脉冲干扰用
         self.pulse_period = 1e-3  # 脉冲周期(s)，仅脉冲干扰用
         self.multi_tone_freqs = [1575.42e6 + 1e6, 1575.42e6 - 1e6]  # 多音干扰频点(Hz)
+
+        # 支持多个干扰源：在预定轨迹中心附近布置（范围较小，默认半径约0.01°≈1.1km）
+        # 生成策略：以轨迹中点为中心，等角度分布 5 个干扰源，参数可在 self.jammers 中查看/修改
+        center = self.target_init_pos + self.target_velocity * (self.sim_time / 2)
+        center_lon, center_lat, center_alt = center
+        spread_deg = 0.01  # 半径（度），约1.11 km（范围不要太大）
+        angles = np.linspace(0, 2 * np.pi, 6)[:-1]  # 5 等分角
+        powers = [50, 30, 20, 10, 5]
+        types = ['multi-tone', 'continuous_wave', 'pulsed', 'bandlimited_gaussian', 'multi-tone']
+        bandwidths = [20e6, 1e6, 1e6, 10e6, 5e6]
+        self.jammers = []
+        for i, ang in enumerate(angles):
+            lon = center_lon + spread_deg * math.cos(ang)
+            lat = center_lat + spread_deg * math.sin(ang)
+            alt = center_alt  # 使用与轨迹中心相近高度
+            jammer = {'pos': np.array([lon, lat, alt]), 'power': powers[i], 'type': types[i], 'bandwidth': bandwidths[i]}
+            if types[i] == 'pulsed':
+                jammer.update({'pulse_width': 5e-6, 'pulse_period': 1e-3, 'duty': 0.005})
+            self.jammers.append(jammer)
         
         # 导航装备参数
         self.combined_nav = "loose"  # 组合导航方式：loose/tight/deep（松/紧/深耦合）
@@ -30,12 +55,6 @@ class SimParams:
         self.Tc = 0.9775e-6  # 伪码码元宽度(s)，C/A码典型值
         self.d = 1  # 码跟踪误差系数(1或1/8)
         self.ins_drift = 0.01  # 惯导漂移率(km/s)，失锁时用
-        
-        # 目标平台参数（巡航导弹示例）
-        self.target_init_pos = np.array([119.045, 27.2233, 1.3])  # 初始经纬高(°/km)
-        self.target_velocity = np.array([0.0005, 0.0003, 0])  # 速度(°/s, °/s, km/s)
-        self.sim_time = 200  # 仿真时长(s)
-        self.sampling_freq = 1  # 采样频率(Hz)
         
         # 卫星参数（模拟4颗GDOP最优卫星）
         self.satellite_pos = np.array([[125.0, 30.0, 20000],  # 卫星经纬高(°/km)
@@ -53,14 +72,16 @@ class SimParams:
         self.dll_unlock_thresh = self.d / 6  # 码环失锁阈值
 
 # ========================= 2. APM电磁传播模型（计算干扰信号功率）=========================
-def calc_jam_power_apm(jam_pos, target_pos, params):
+def calc_jam_power_apm(jammer, target_pos, params):
     """
-    基于APM模型计算到达接收机的干扰信号功率P_J
-    :param jam_pos: 干扰源位置(经纬高)
+    基于APM模型计算来自单个干扰源到达接收机的干扰信号功率P_J
+    :param jammer: 干扰源 dict，包含 'pos' (经纬高), 'power' (W), 可选其他字段
     :param target_pos: 目标位置(经纬高)
     :param params: 仿真参数类
     :return: 干扰信号接收功率P_J(W)
     """
+    jam_pos = jammer['pos']
+    jam_power = jammer.get('power', params.jam_power)
     # 转换为距离（经纬度转地表距离，简化处理，实际需用WGS84坐标系）
     lon_diff = (jam_pos[0] - target_pos[0]) * np.pi / 180
     lat_diff = (jam_pos[1] - target_pos[1]) * np.pi / 180
@@ -68,10 +89,10 @@ def calc_jam_power_apm(jam_pos, target_pos, params):
     dist_horizontal = earth_radius * np.sqrt(lon_diff**2 + lat_diff**2)  # 水平距离(km)
     dist_vertical = abs(jam_pos[2] - target_pos[2])  # 垂直距离(km)
     dist = np.sqrt(dist_horizontal**2 + dist_vertical**2) * 1000  # 总距离(米)
-    
+
     # APM模型选择（根据距离和仰角）
     antenna_elevation = np.arctan2(dist_vertical * 1000, dist_horizontal * 1000) * 180 / np.pi  # 天线仰角(°)
-    
+
     if antenna_elevation > 5 or dist < 5000:
         # FE模型（平面地球，忽略折射和曲率）
         loss = (4 * np.pi * dist * params.fc / params.c) ** 2  # 自由空间损耗
@@ -85,9 +106,9 @@ def calc_jam_power_apm(jam_pos, target_pos, params):
     else:
         # XO模型（扩展光学，适用于高空）
         loss = (4 * np.pi * dist * params.fc / params.c) ** 2 * 0.8  # 损耗修正
-    
+
     # 干扰接收功率 = 发射功率 * 天线增益（简化为1） / 路径损耗
-    Pj = params.jam_power / loss
+    Pj = jam_power / loss
     return Pj
 
 # ========================= 3. 功率谱密度计算（随干扰样式变化）=========================
@@ -266,14 +287,17 @@ def main_simulation():
         target_pos = params.target_init_pos + params.target_velocity * t
         target_positions.append(target_pos)
         
-        # 2. 计算干扰信号接收功率（APM模型）
-        Pj = calc_jam_power_apm(params.jam_pos, target_pos, params)
-        
-        # 3. 求解定位误差
-        pos_error, unlock_flag, cnr = solve_position_error(target_pos, params.satellite_pos, Pj, params)
+        # 2. 计算干扰信号接收功率（来自多个干扰源的贡献）
+        Pj_total = 0.0
+        for jammer in params.jammers:
+            Pj_total += calc_jam_power_apm(jammer, target_pos, params)
+
+        # 3. 求解定位误差（使用所有干扰源的总接收功率）
+        pos_error, unlock_flag, cnr = solve_position_error(target_pos, params.satellite_pos, Pj_total, params)
         errors.append(pos_error)
         unlock_flags.append(unlock_flag)
         cnr_list.append(cnr)
+
         
         # 4. 计算受干扰后目标位置
         error_pos = target_pos + pos_error
@@ -298,7 +322,13 @@ def visualize_results(true_traj, error_traj, errors, cnr_list, unlock_flags, par
     plt.subplot(2, 2, 1)
     plt.plot(true_traj[:, 0], true_traj[:, 1], 'g-', label='预定轨迹', linewidth=2)
     plt.plot(error_traj[:, 0], error_traj[:, 1], 'r-', label='受干扰轨迹', linewidth=2)
-    plt.scatter(params.jam_pos[0], params.jam_pos[1], c='blue', marker='x', s=200, label='干扰源')
+    # 绘制所有干扰源
+    for j in params.jammers:
+        plt.scatter(j['pos'][0], j['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({j.get('type','')})")
+    # 确保图例项不重复
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys())
     plt.xlabel('经度(°)')
     plt.ylabel('纬度(°)')
     plt.legend()
