@@ -28,6 +28,7 @@ class SimParams:
         self.pulse_width = 10e-6  # 脉冲宽度(s)，仅脉冲干扰用
         self.pulse_period = 1e-3  # 脉冲周期(s)，仅脉冲干扰用
         self.multi_tone_freqs = [1575.42e6 + 1e6, 1575.42e6 - 1e6]  # 多音干扰频点(Hz)
+        self.jam_gaint = 1e9# 天线增益
 
         # 支持多个干扰源：在预定轨迹中心附近布置（范围较小，默认半径约0.01°≈1.1km）
         # 生成策略：以轨迹中点为中心，等角度分布 5 个干扰源，参数可在 self.jammers 中查看/修改
@@ -64,12 +65,59 @@ class SimParams:
         self.sat_carrier_power = 1e-16  # 卫星信号载波功率(C, W)
         
         # 跟踪环参数（与组合导航方式绑定）
-        self.Bp = 18 if self.combined_nav in ["loose", "tight"] else 21  # PLL带宽(Hz)
+        self.Bp = 18 if self.combined_nav in ["loose", "tight"] else 2  # PLL带宽(Hz)
         self.Bd = self.Bp  # DLL带宽(Hz)，与PLL一致
         
         # 失锁判定阈值
         self.pll_unlock_thresh = 15  # 载波环失锁阈值(°)
         self.dll_unlock_thresh = self.d / 6  # 码环失锁阈值
+
+# ========================= . 经纬度转换ECEF(单位:米)=========================
+def lla_to_ecef(lon_deg, lat_deg, h_km):
+    """
+    将经纬度高度（lat_deg, lon_deg, h_km，单位：度/度/千米）转换为 ECEF（米）。
+    返回 [X, Y, Z]（单位：米）。
+    """
+    a = 6378137.0
+    f = 1/298.257223563
+    e2 = 2*f - f*f
+    h_m = h_km * 1000.0  # km -> m
+
+    φ = np.deg2rad(lat_deg); λ = np.deg2rad(lon_deg)
+    N = a / np.sqrt(1 - e2 * np.sin(φ)**2)
+    X = (N + h_m) * np.cos(φ) * np.cos(λ)
+    Y = (N + h_m) * np.cos(φ) * np.sin(λ)
+    Z = ((1 - e2) * N + h_m) * np.sin(φ)
+    return np.array([X, Y, Z])        
+
+
+# ========================= ECEF 转回 经纬度高度（单位: 度/度/米）=========================
+def ecef_to_lla(X, Y, Z):
+    """
+    将 ECEF（米）转换为经纬度高度：返回 (lon_deg, lat_deg, h_m)。
+    使用 Bowring / 非迭代近似方法，适用于定位精度需求的仿真场景。
+    """
+    a = 6378137.0
+    f = 1/298.257223563
+    b = a * (1 - f)
+    e2 = 2*f - f*f
+    ep2 = (a**2 - b**2) / (b**2)
+
+    p = np.sqrt(X*X + Y*Y)
+    # 处理极区（p near 0）情况
+    if p < 1e-12:
+        lon = 0.0
+        lat = np.sign(Z) * (np.pi/2)
+        h = abs(Z) - b
+        return lon, np.rad2deg(lat), h
+
+    theta = np.arctan2(Z * a, p * b)
+    lon = np.arctan2(Y, X)
+    lat = np.arctan2(Z + ep2 * b * np.sin(theta)**3,
+                     p - e2 * a * np.cos(theta)**3)
+    N = a / np.sqrt(1 - e2 * np.sin(lat)**2)
+    h = (p / np.cos(lat) - N) / 1000.0  # m -> km
+    return np.rad2deg(lon), np.rad2deg(lat), h
 
 # ========================= 2. APM电磁传播模型（计算干扰信号功率）=========================
 def calc_jam_power_apm(jammer, target_pos, params):
@@ -82,13 +130,13 @@ def calc_jam_power_apm(jammer, target_pos, params):
     """
     jam_pos = jammer['pos']
     jam_power = jammer.get('power', params.jam_power)
-    # 转换为距离（经纬度转地表距离，简化处理，实际需用WGS84坐标系）
-    lon_diff = (jam_pos[0] - target_pos[0]) * np.pi / 180
-    lat_diff = (jam_pos[1] - target_pos[1]) * np.pi / 180
-    earth_radius = 6371  # 地球半径(km)
-    dist_horizontal = earth_radius * np.sqrt(lon_diff**2 + lat_diff**2)  # 水平距离(km)
-    dist_vertical = abs(jam_pos[2] - target_pos[2])  # 垂直距离(km)
-    dist = np.sqrt(dist_horizontal**2 + dist_vertical**2) * 1000  # 总距离(米)
+    # 转换为距离（经纬度转ecef坐标）
+    jam_ecef = lla_to_ecef(jam_pos[0], jam_pos[1], jam_pos[2])
+    target_ecef = lla_to_ecef(target_pos[0], target_pos[1], target_pos[2])
+    dist = np.linalg.norm(jam_ecef - target_ecef)  # 总距离(米)
+
+    dist_vertical = abs((jam_pos[2] - target_pos[2]) * 1000)  # 垂直距离(米)
+    dist_horizontal = np.sqrt(dist**2 - dist_vertical**2)  # 水平距离(米)
 
     # APM模型选择（根据距离和仰角）
     antenna_elevation = np.arctan2(dist_vertical * 1000, dist_horizontal * 1000) * 180 / np.pi  # 天线仰角(°)
@@ -108,7 +156,7 @@ def calc_jam_power_apm(jammer, target_pos, params):
         loss = (4 * np.pi * dist * params.fc / params.c) ** 2 * 0.8  # 损耗修正
 
     # 干扰接收功率 = 发射功率 * 天线增益（简化为1） / 路径损耗
-    Pj = jam_power / loss
+    Pj = jam_power * params.jam_gaint / loss
     return Pj
 
 # ========================= 3. 功率谱密度计算（随干扰样式变化）=========================
@@ -180,18 +228,22 @@ def calc_tracking_errors(C_NJ_dB, params):
     
     # 2. 码环跟踪误差σ_JDLL(NELP)
     # 计算积分项
+    """积分项1：∫G_J(f)G_S(f)·sin²(πf d Tc) df"""
     def integrand_sin2(f):
         GJ, GS = calc_power_spectral_density(f, params)
         return GJ * GS * (np.sin(np.pi * f * params.d * params.Tc)) ** 2
     
+    """积分项2：∫f·G_S(f)·sin(πf d Tc) df"""
     def integrand_fsin(f):
         GJ, GS = calc_power_spectral_density(f, params)
         return f * GS * np.sin(np.pi * f * params.d * params.Tc)
     
+    """积分项3：∫G_J(f)G_S(f)·cos²(πf d Tc) df"""
     def integrand_cos2(f):
         GJ, GS = calc_power_spectral_density(f, params)
         return GJ * GS * (np.cos(np.pi * f * params.d * params.Tc)) ** 2
     
+    """积分项4：∫G_S(f)·cos(πf d Tc) df"""
     def integrand_cos(f):
         GJ, GS = calc_power_spectral_density(f, params)
         return GS * np.cos(np.pi * f * params.d * params.Tc)
@@ -362,11 +414,10 @@ def visualize_results(true_traj, error_traj, errors, cnr_list, unlock_flags, par
     
     # 4. 误差统计直方图
     plt.subplot(2, 2, 4)
-    total_error = np.linalg.norm(errors, axis=1)
-    plt.hist(total_error, bins=20, alpha=0.7, color='green', edgecolor='black')
-    plt.xlabel('总定位误差(°/km)')
-    plt.ylabel('频次')
-    plt.title('定位误差分布')
+    plt.plot(time, np.sqrt(errors[:, 0]**2 + errors[:, 1]**2 + errors[:, 2]**2), 'r-')
+    plt.xlabel('时间(s)')
+    plt.ylabel('总定位误差(°)')
+    plt.title('总定位误差变化曲线')
     plt.grid(True)
     
     plt.tight_layout()
