@@ -16,11 +16,7 @@ class SimParams:
         self.C_N0_nom = 45  # 标称载噪比 (dB-Hz)
         self.C_N0_th = 28   # 接收机跟踪阈值载噪比 (dB-Hz)
         self.c_light = 3e8        # 光速 (m/s)
-
-        self.signal_type = "CA_code"  # CA_code/P_code/M_code
-        self.Tc = 0.9775e-6  # C/A码码元宽度(s)，P码：0.09775e-6，M码：0.1e-6
-        self.fs = 1.023e6  # M码副载频(Hz)，仅M码使用
-        self.C = 1e-16  # 卫星信号载波功率(W)
+        
         self.sat_carrier_power = self.C  # 兼容 calc_cnr 函数命名
 
         # 接收机参数
@@ -29,22 +25,35 @@ class SimParams:
         self.G_ant = 10     # 抗干扰波束成形增益 (dB)
 
         self.jam_type = "continuous_wave"  # continuous_wave/bandlimited_gaussian/pulse
-        self.fj = 1575.42e6  # 干扰中心频率(Hz，GPS L1频段)
-        self.beta_r = 20e6  # 接收机前端等效预相关带宽  [0.5e6, 1e6, 2e6, 5e6, 10e6]
-        self.fc = self.fj  # 兼容 sim.py 的命名（中心频率）
-        self.tau = 10e-6  # 脉冲宽度(s)，脉冲干扰用
-        self.Bp = 18  # PLL 带宽(Hz)
+        
         self.Bd = self.Bp  # DLL 带宽(Hz)
-        self.Td = 0.02  # 相关积分时间(s)
 
-        # 连续波窄带近似带宽（Hz），用于将 δ 函数近似为窄带矩形谱
+        # G_J(f) 计算相关参数
+        self.f_j = 1575.42e6  # 单频干扰中心频率(Hz，GPS L1频段)
+        self.B_j = 2e6      # 干扰带宽 (Hz, 窄带干扰)
+        self.f_de = 1e6     # 噪声调频有效调频带宽 (Hz)
+
+        # G_S(f) 计算相关参数 # DLL 计算相关参数
         self.continuous_bw = 1e4  # 10 kHz 默认值
+        self.tau = 10e-6  # 脉冲宽度(s)，脉冲干扰用
         self.T = 1e-3  # 脉冲周期(s)，脉冲干扰用
 
+        self.signal_type = "CA_code"  # CA_code/P_code/M_code
+        self.Tc = 0.9775e-6  # C/A码码元宽度(s)，P码：0.09775e-6 M码：0.1e-6
+        self.fs = 1.023e6  # M码副载频(Hz)，仅M码使用
+
+        # PLL 计算相关参数
+        self.beta_r = 20e6  # 接收机前端等效预相关带宽  [0.5e6, 1e6, 2e6, 5e6, 10e6]
+        self.P_j = -100     # 进入跟踪环路的干扰功率 (dBm)
+
+        self.Bp = 18    # PLL 接收机环路带宽(Hz) 松紧耦合为18Hz，深耦合为2Hz
+        self.Td = 0.02  # 相关积分时间(s)
+        self.C = 1e-16  # 卫星信号载波功率(W)
+
+        # 连续波窄带近似带宽（Hz），用于将 δ 函数近似为窄带矩形谱
+
         # 干扰参数
-        self.P_j = -100     # 干扰功率 (dBm)
         self.P_s = -130     # 卫星信号功率 (dBm)
-        self.B_j = 2e6      # 干扰带宽 (Hz, 窄带干扰)
 
         # 积分项参数
         self.d = 1  # 码跟踪误差系数(1或1/8)
@@ -159,13 +168,13 @@ def calc_GJ(f, params):
     if params.jam_type == "continuous_wave":
         # 将 δ 近似为宽度为 continuous_bw 的矩形功率谱，幅值归一化为 1/带宽
         bw = getattr(params, 'continuous_bw', 1e3)
-        return (1.0 / bw) if abs(f - params.fj) <= bw/2 else 0
+        return (1.0 / bw) if abs(f - params.f_j) <= bw/2 else 0
     elif params.jam_type == "bandlimited_gaussian":
         return 1 / params.beta if abs(f) <= params.beta/2 else 0
     elif params.jam_type == "pulse":
-        n = round((f - params.fj) * params.T)
-        sa_term = np.sinc((f - params.fj) * params.tau)
-        return (params.tau / params.T) * (sa_term ** 2) if abs(f - params.fj) <= params.beta/2 else 0
+        n = round((f - params.f_j) * params.T)
+        sa_term = np.sinc((f - params.f_j) * params.tau)
+        return (params.tau / params.T) * (sa_term ** 2) if abs(f - params.f_j) <= params.beta/2 else 0
     return 0
 
 # ========================= 4个核心积分项求解 =========================
@@ -379,8 +388,7 @@ def calc_cn0_with_jammers(params, rx_pos, time):
     C_N0_j = params.C_N0_nom - delta_CN0
     return C_N0_j, delta_CN0
 
-# -------------------------- 5. 定位误差计算主函数 --------------------------
-# -------------------------- 5. 仿真主流程（sim.py 风格） --------------------------
+# -------------------------- 5. 仿真主流程 --------------------------
 
 def main_simulation():
     """逐时刻按预定航线仿真，使用 SimParams、APM 多源干扰与跟踪环误差判定"""
@@ -405,7 +413,7 @@ def main_simulation():
             Pj_total += calc_jam_power_apm(jammer, rx_pos, params)
 
         # 将多源合成的干扰功率注入到 params 中，以供后续的跟踪环误差计算使用
-        params.Pj = Pj_total
+        params.P_j = Pj_total
         # 合成带宽采用最大干扰带宽的近似
         params.B_j = max([j.get('B_j', params.B_j) for j in params.jammers])
 
