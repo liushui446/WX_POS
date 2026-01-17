@@ -86,7 +86,7 @@ class SimParams:
         spread_deg = 0.07 # 半径（度），约1.11 km（范围不要太大）
         angles = np.linspace(0, 2 * np.pi, 4)[:-1]  # 3 等分角
         # powers = [50, 30, 20, 10, 5]
-        powers = [7, 7, 7]
+        powers = [10, 10, 10]
         # types = ['multi-tone', 'continuous_wave', 'pulsed', 'bandlimited_gaussian', 'pseudocode'] 噪声调频干扰
         types = ['continuous_wave', 'continuous_wave', 'continuous_wave']
         bandwidths = [20e6, 1e6, 1e6, 10e6, 5e6]
@@ -107,15 +107,15 @@ class SimParams:
         
         self.Tc = 9.77e-7  # 伪码码元宽度(s)，C/A码典型值, P(Y)码 9.7752e-5 (s)，M码为1e-4 (s)
         self.fs = 10.23e6  # M码副载频(Hz)
-        self.d = 1  # 码跟踪误差系数(1或1/8)
+        self.d = 1/8  # 码跟踪误差系数(1或1/8)
         self.beta = 2e6  # 接收机等效预相关带宽(Hz)，C/A 码典型带宽
         self.ins_drift = 0.01  # 惯导漂移率(km/s)，失锁时用
         
         # 卫星参数（模拟4颗GDOP最优卫星）
-        self.satellite_pos = np.array([[125.0, 30.0, 20000],  # 卫星经纬高(°/km)
-                                       [115.0, 35.0, 20000],
-                                       [130.0, 25.0, 20000],
-                                       [110.0, 28.0, 20000]])
+        self.satellite_pos = np.array([[125.0, 30.0, 5000],  # 卫星经纬高(°/km)
+                                       [115.0, 35.0, 5000],
+                                       [130.0, 25.0, 5000],
+                                       [110.0, 28.0, 5000]])
         self.sat_carrier_power = 1e-16  # 卫星信号载波功率(C, W)
         
         # 跟踪环参数（与组合导航方式绑定）
@@ -304,7 +304,7 @@ def calc_jammer_to_signal_ratio(target_pos, params, Pj, cnt = 0):
         # 卫星发射功率（典型GPS卫星EIRP约48.5 dBW，转换为线性值：10^(48.5/10)=70794.58 W）
         sat_eirp = 70794.58 
         # sat_eirp = 48.5
-        Ps_sat = sat_eirp / loss_sat  # 单颗卫星信号接收功率
+        Ps_sat = sat_eirp * 100 / loss_sat  # 单颗卫星信号接收功率
         Ps_total += Ps_sat  # 多颗卫星信号功率叠加
     
     # 3. 计算干信比
@@ -383,8 +383,8 @@ def calc_gdop(target_pos, satellite_pos):
     # 构建几何矩阵G（简化版，实际需转换为ECEF坐标系）
     G = []
     for sat in satellite_pos:
-        sat_ecef = lla_to_ecef(sat)
-        target_pos_ecef = lla_to_ecef(target_pos)
+        sat_ecef = lla_to_ecef(sat[0], sat[1], sat[2])
+        target_pos_ecef = lla_to_ecef(target_pos[0], target_pos[1], target_pos[2])
         delta = sat_ecef - target_pos_ecef
         dist = np.linalg.norm(delta)
         if dist == 0:
@@ -402,17 +402,18 @@ def calc_gdop(target_pos, satellite_pos):
     return gdop
 
 # ========================= 8. 结果可视化（轨迹+误差+载噪比）=========================
-def visualize_results(true_traj, errors, cnr_list, unlock_flags, c_nj_flags, js_ratio_list, sigma_jdll_list, params):
-    time = np.arange(len(errors)) / params.sampling_freq
+def visualize_results(true_traj, error_traj, errors_m, cnr_list, unlock_flags, c_nj_flags, js_ratio_list, sigma_jdll_list, params):
+    time = np.arange(len(errors_m)) / params.sampling_freq
     plt.figure(figsize=(15, 10))
     
     # 1. 2D轨迹对比（经纬度平面）
     plt.subplot(3, 2, 1)
     plt.plot(true_traj[:, 0], true_traj[:, 1], 'g-', label='预定轨迹', linewidth=2)
-    # plt.plot(error_traj[:, 0], error_traj[:, 1], 'r-', label='受干扰轨迹', linewidth=2)
+    plt.plot(error_traj[:, 0], error_traj[:, 1], 'r-', label='受干扰轨迹', linewidth=2)
     # 绘制所有干扰源
-    for j in params.jammers:
-        plt.scatter(j['pos'][0], j['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({j.get('type','')})")
+    # for j in params.jammers:
+    #     plt.scatter(j['pos'][0], j['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({j.get('type','')})")
+    plt.scatter(params.jammers[0]['pos'][0], params.jammers[0]['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({params.jammers[0].get('type','')})")
     # 确保图例项不重复
     handles, labels = plt.gca().get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
@@ -425,9 +426,9 @@ def visualize_results(true_traj, errors, cnr_list, unlock_flags, c_nj_flags, js_
     
     # 2. 定位误差随时间变化
     plt.subplot(3, 2, 2)
-    plt.plot(time, errors[:, 0], 'r-', label='经度误差(°)')
-    plt.plot(time, errors[:, 1], 'g-', label='纬度误差(°)')
-    plt.plot(time, errors[:, 2], 'b-', label='高度误差(km)')
+    plt.plot(time, errors_m[:, 0], 'r-', label='经度误差(m)')
+    plt.plot(time, errors_m[:, 1], 'g-', label='纬度误差(m)')
+    plt.plot(time, errors_m[:, 2], 'b-', label='高度误差(m)')
     # 标记失锁时段
     unlock_times = time[unlock_flags]
     if len(unlock_times) > 0:
@@ -470,9 +471,9 @@ def visualize_results(true_traj, errors, cnr_list, unlock_flags, c_nj_flags, js_
 
     # 6. 误差统计直方图
     plt.subplot(3, 2, 6)
-    plt.plot(time, np.sqrt(errors[:, 0]**2 + errors[:, 1]**2 + errors[:, 2]**2), 'r-')
+    plt.plot(time, np.sqrt(errors_m[:, 0]**2 + errors_m[:, 1]**2 + errors_m[:, 2]**2), 'r-')
     plt.xlabel('时间(s)')
-    plt.ylabel('总定位误差(°)')
+    plt.ylabel('总定位误差(m)')
     plt.title('总定位误差变化曲线')
     plt.grid(True)
     
@@ -486,8 +487,9 @@ def main_simulation():
     params = SimParams()
     time_steps = int(params.sim_time * params.sampling_freq)
     target_positions = []  # 目标真实轨迹
-    # error_positions = []   # 受干扰后轨迹
+    error_positions = []   # 受干扰后轨迹
     errors = []            # 定位误差序列
+    errors_m = []          # 定位误差序列（米）
     cnr_list = []          # 载噪比序列
     unlock_flags = []      # 失锁标志序列
     unlock_ts = []      # 失锁标志序列
@@ -536,24 +538,30 @@ def main_simulation():
             # 6. 求解定位误差（使用所有干扰源的总接收功率）
             if unlock_flag:
                 # 场景1：失锁，使用惯导定位，误差随时间累积
-                pos_error = np.array([(params.ins_drift/111), (params.ins_drift/111), 0.1])  # 简化累积偏差
-                #pos_error = ecef_to_lla(params.ins_drift, params.ins_drift, 100)
+                pos_error = np.array([params.ins_drift/111, (params.ins_drift/111), 0.1])  # 简化累积偏差
+                # pos_error = ecef_to_lla(params.ins_drift, params.ins_drift, 100)
+                pos_error_m = np.array([params.ins_drift * 1000, params.ins_drift * 1000, params.ins_drift * 1000])
             else:
                 # 场景2：未失锁，伪距误差×GDOP
-                pseudo_range_error = sigma_jdll * params.c  # 码跟踪误差转换为伪距误差(米)
+                pseudo_range_error = sigma_jdll * params.Tc * params.c
+                # pseudo_range_error = sigma_jdll * params.c  # 码跟踪误差转换为伪距误差(米)
                 gdop = calc_gdop(target_pos, params.satellite_pos)
                 # 转换为经纬高误差（简化：米→度，1度≈111km）
                 # pos_error = (pseudo_range_error / 1000 / 111) * gdop  # 经度/纬度误差(°)
-                pos_error = (pseudo_range_error) * gdop  # 经度/纬度误差(°)
-                pos_error = np.array([pos_error, pos_error, pseudo_range_error / 1000 * gdop])  # 高度误差(km)
-                pos_error
+                pos_error_single = (pseudo_range_error) * gdop  # 经度/纬度误差(m)
+                pos_error = np.array([pos_error_single/(1000 * 111), pos_error_single/(1000 * 111), pos_error_single / 1000])  # 高度误差(km)
+                pos_error_m = np.array([pos_error_single, pos_error_single, pos_error_single])  # 高度误差(m)
         else:
             # 干扰无效，定位误差为正常GNSS误差
-            pos_error = np.array([0.0001, 0.0001, 0.001])
+            # pos_error = np.array([0.0001, 0.0001, 0.001])
+            pos_error = np.array([0.0, 0.0, 0.0])
+            pos_error_m = np.array([0.0, 0.0, 0.0])
             unlock_flag = False
             sigma_jdll_list.append(0)
 
         errors.append(pos_error)
+        errors_m.append(pos_error_m)
+        error_positions.append(target_pos + pos_error)
         unlock_flags.append(unlock_flag)
         if unlock_flag:
             unlock_ts.append(unlock_flag)
@@ -563,8 +571,9 @@ def main_simulation():
 
     # 转换为numpy数组
     target_positions = np.array(target_positions)
-    # error_positions = np.array(error_positions)
+    error_positions = np.array(error_positions)
     errors = np.array(errors)
+    errors_m = np.array(errors_m)
     cnr_list = np.array(cnr_list)
     unlock_flags = np.array(unlock_flags)
     c_nj_flags = np.array(c_nj_flags)
@@ -573,7 +582,7 @@ def main_simulation():
     print(f"仿真结束：总时刻={params.sim_time}, 失锁时刻={np.sum(unlock_ts)}")
 
     # 7. 结果可视化
-    visualize_results(target_positions, errors, cnr_list, unlock_flags, c_nj_flags, js_ratio_list, sigma_jdll_list,params)
+    visualize_results(target_positions, error_positions, errors_m,cnr_list, unlock_flags, c_nj_flags, js_ratio_list, sigma_jdll_list,params)
 
 # 运行仿真
 if __name__ == "__main__":
