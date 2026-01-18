@@ -99,6 +99,8 @@ class SimParams:
             if types[i] == 'pulsed':
                 jammer.update({'pulse_width': 5e-6, 'pulse_period': 1e-3, 'duty': 0.005})
             self.jammers.append(jammer)
+
+        # self.jammers[0]['pos'] = np.array([119.75, 27.64, 8.3])  # 微调第一个干扰源位置
         
         # 导航装备参数
         self.combined_nav = "loose"  # 组合导航方式：loose/tight/deep（松/紧/深耦合）
@@ -414,6 +416,9 @@ def visualize_results(true_traj, error_traj, errors_m, cnr_list, unlock_flags, c
     # for j in params.jammers:
     #     plt.scatter(j['pos'][0], j['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({j.get('type','')})")
     plt.scatter(params.jammers[0]['pos'][0], params.jammers[0]['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({params.jammers[0].get('type','')})")
+    # 打印干扰源位置
+    print(f"干扰源{1}：位置 = {params.jammers[0]['pos'][0]}, {params.jammers[0]['pos'][1]}, {params.jammers[0]['pos'][2]}")
+    
     # 确保图例项不重复
     handles, labels = plt.gca().get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
@@ -492,81 +497,133 @@ def main_simulation():
     errors_m = []          # 定位误差序列（米）
     cnr_list = []          # 载噪比序列
     unlock_flags = []      # 失锁标志序列
-    unlock_ts = []      # 失锁标志序列
-    c_nj_flags = []      # 载噪比有效标志序列
-    js_ratio_list = []    # 干信比序列
-    sigma_jdll_list = []  # 码环误差序列
+    unlock_ts = []         # 失锁标志序列
+    c_nj_flags = []        # 载噪比有效标志序列
+    js_ratio_list = []     # 干信比序列
+    sigma_jdll_list = []   # 码环误差序列
     
     # 仿真主循环
     for t in range(time_steps):
+        errors_total = [0.0, 0.0, 0.0]            # 所有干扰源定位误差
+        errors_m_total = [0.0, 0.0, 0.0]          # 所有干扰源定位误差（米）
+        lock_errors_total = [0.0, 0.0, 0.0]            # 所有未失锁干扰源定位误差
+        lock_errors_m_total = [0.0, 0.0, 0.0]          # 所有未失锁干扰源定位误差（米）
+        sigma_jdll_total = 0.0
+        unlock_flag_final = False
+        c_nj_flag_final = False
+        C_NJ_dB_total = 0.0
+        J_S_dB_total = 0.0
+        lock_num = 0  # 未失锁的干扰源个数
+        unlock_num = 0  # 失锁的干扰源个数
+
         # 1. 计算目标实时位置
         target_pos = params.target_init_pos + params.target_velocity * t
         target_positions.append(target_pos)
 
-        # 2. 计算干扰信号接收功率（来自多个干扰源的贡献）
         cnt = 0
-        Pj_list = []
-        jammer = params.jammers[0]  # 目前仅支持单个干扰源计算
-        Pj = calc_jam_power_apm(jammer, target_pos, params)
-        # Pj_list.append(Pj)
+        # jammer = params.jammers[0]  # 目前仅支持单个干扰源计算
 
-        # 3. 计算载噪比
-        C_NJ_dB = calc_cnr(Pj, params)
-        # C_NJ_dB = calc_cn0_jamming(params, Pj)
-        print(f"C_NJ_dB = {C_NJ_dB}")
-
-        # 计算干信比 J/S
-        J_S, J_S_dB = calc_jammer_to_signal_ratio(target_pos, params, Pj, cnt)
-        js_ratio_list.append(J_S_dB)
-
-        c_nj_flag = 0
-        if C_NJ_dB < 40:  # 干扰有效（载噪比低于正常阈值） 原来是30
-            # C_NJ_dB_ = 20
-            c_nj_flag = 1
-
-            # 4. 计算跟踪环误差
-            sigma_jpll, sigma_jdll = calc_tracking_errors(C_NJ_dB, J_S, params, cnt)
-            print(f"sigma_jpll_ = {sigma_jpll}, sigma_jdll_ = {sigma_jdll}")
-            sigma_jdll_list.append(sigma_jdll)
-            
-            # 5. 判定失锁状态
-            pll_unlock = sigma_jpll > params.pll_unlock_thresh
-            dll_unlock = sigma_jdll > params.dll_unlock_thresh
-            unlock_flag = pll_unlock or dll_unlock
-            
-            
-            # 6. 求解定位误差（使用所有干扰源的总接收功率）
-            if unlock_flag:
-                # 场景1：失锁，使用惯导定位，误差随时间累积
-                pos_error = np.array([params.ins_drift/111, (params.ins_drift/111), 0.1])  # 简化累积偏差
-                # pos_error = ecef_to_lla(params.ins_drift, params.ins_drift, 100)
-                pos_error_m = np.array([params.ins_drift * 1000, params.ins_drift * 1000, params.ins_drift * 1000])
-            else:
-                # 场景2：未失锁，伪距误差×GDOP
-                pseudo_range_error = sigma_jdll * params.Tc * params.c
-                # pseudo_range_error = sigma_jdll * params.c  # 码跟踪误差转换为伪距误差(米)
-                gdop = calc_gdop(target_pos, params.satellite_pos)
-                # 转换为经纬高误差（简化：米→度，1度≈111km）
-                # pos_error = (pseudo_range_error / 1000 / 111) * gdop  # 经度/纬度误差(°)
-                pos_error_single = (pseudo_range_error) * gdop  # 经度/纬度误差(m)
-                pos_error = np.array([pos_error_single/(1000 * 111), pos_error_single/(1000 * 111), pos_error_single / 1000])  # 高度误差(km)
-                pos_error_m = np.array([pos_error_single, pos_error_single, pos_error_single])  # 高度误差(m)
-        else:
-            # 干扰无效，定位误差为正常GNSS误差
-            # pos_error = np.array([0.0001, 0.0001, 0.001])
-            pos_error = np.array([0.0, 0.0, 0.0])
-            pos_error_m = np.array([0.0, 0.0, 0.0])
+        # 分别计算每个干扰源的功率和影响
+        for jammer in params.jammers:
+            # unlock_pos_error = np.array([0.0, 0.0, 0.0])
+            # unlock_pos_error_m = np.array([0.0, 0.0, 0.0])
+            lock_pos_error = np.array([0.0, 0.0, 0.0])
+            lock_pos_error_m = np.array([0.0, 0.0, 0.0])
+            invalid_pos_error = np.array([0.0, 0.0, 0.0])
+            invalid_pos_error_m = np.array([0.0, 0.0, 0.0])
+            sigma_jdll = 0.0
             unlock_flag = False
-            sigma_jdll_list.append(0)
 
-        errors.append(pos_error)
-        errors_m.append(pos_error_m)
-        error_positions.append(target_pos + pos_error)
-        unlock_flags.append(unlock_flag)
-        if unlock_flag:
-            unlock_ts.append(unlock_flag)
-        cnr_list.append(C_NJ_dB)
-        c_nj_flags.append(c_nj_flag)
+            # 2. 计算干扰信号接收功率
+            Pj = calc_jam_power_apm(jammer, target_pos, params)
+
+            # 3. 计算载噪比
+            C_NJ_dB = calc_cnr(Pj, params)
+            # C_NJ_dB = calc_cn0_jamming(params, Pj)
+            print(f"C_NJ_dB = {C_NJ_dB}")
+
+            # 计算干信比 J/S
+            J_S, J_S_dB = calc_jammer_to_signal_ratio(target_pos, params, Pj, cnt)
+
+            c_nj_flag = False
+            if C_NJ_dB < 40:  # 干扰有效（载噪比低于正常阈值） 原来是30
+                # C_NJ_dB_ = 20
+                # 标记干扰有效
+                c_nj_flag = True
+
+                # 4. 计算跟踪环误差
+                sigma_jpll, sigma_jdll = calc_tracking_errors(C_NJ_dB, J_S, params, cnt)
+                print(f"sigma_jpll_ = {sigma_jpll}, sigma_jdll_ = {sigma_jdll}")
+                
+                # 5. 判定失锁状态
+                pll_unlock = sigma_jpll > params.pll_unlock_thresh
+                dll_unlock = sigma_jdll > params.dll_unlock_thresh
+                unlock_flag = pll_unlock or dll_unlock
+                
+                # 6. 求解定位误差（使用所有干扰源的总接收功率）
+                if unlock_flag:
+                    unlock_num += 1
+                    # 场景1：失锁，使用惯导定位，误差随时间累积
+                    # unlock_pos_error = np.array([params.ins_drift/111, (params.ins_drift/111), 0.1])  # 简化累积偏差
+                    # pos_error = ecef_to_lla(params.ins_drift, params.ins_drift, 100)
+                    # unlock_pos_error_m = np.array([params.ins_drift * 1000, params.ins_drift * 1000, params.ins_drift * 1000])
+                else:
+                    lock_num += 1
+                    # 场景2：未失锁，伪距误差×GDOP
+                    pseudo_range_error = sigma_jdll * params.Tc * params.c
+                    # pseudo_range_error = sigma_jdll * params.c  # 码跟踪误差转换为伪距误差(米)
+                    gdop = calc_gdop(target_pos, params.satellite_pos)
+                    # 转换为经纬高误差（简化：米→度，1度≈111km）
+                    # pos_error = (pseudo_range_error / 1000 / 111) * gdop  # 经度/纬度误差(°)
+                    pos_error_single = (pseudo_range_error) * gdop  # 经度/纬度误差(m)
+                    lock_pos_error = np.array([pos_error_single/(1000 * 111), pos_error_single/(1000 * 111), pos_error_single / 1000])  # 高度误差(km)
+                    lock_pos_error_m = np.array([pos_error_single, pos_error_single, pos_error_single])  # 高度误差(m)
+            else:
+                # 干扰无效，定位误差为正常GNSS误差
+                # pos_error = np.array([0.0001, 0.0001, 0.001])
+                invalid_pos_error = np.array([0.0, 0.0, 0.0])
+                invalid_pos_error_m = np.array([0.0, 0.0, 0.0])
+                sigma_jdll = 0.0
+
+            unlock_flag_final = unlock_flag_final or unlock_flag
+            c_nj_flag_final = c_nj_flag_final or c_nj_flag
+
+            # 累加所有干扰源的误差贡献
+            lock_errors_total += lock_pos_error
+            lock_errors_m_total += lock_pos_error_m
+            lock_pos_error = np.array([0.0, 0.0, 0.0])
+            lock_pos_error_m = np.array([0.0, 0.0, 0.0])
+            sigma_jdll_total += sigma_jdll
+            C_NJ_dB_total += C_NJ_dB  # 简单累加（可改为更复杂的合成方式）
+            J_S_dB_total += J_S_dB
+            # 干扰源序号递增
+            cnt += 1
+        
+        # 7. 综合所有干扰源的定位误差
+        # 存在失锁干扰源
+        if unlock_num > 0:
+            # 场景1：失锁，使用惯导定位，误差随时间累积
+            unlock_pos_error = np.array([params.ins_drift/111, (params.ins_drift/111), 0.1])  # 简化累积偏差
+            # pos_error = ecef_to_lla(params.ins_drift, params.ins_drift, 100)
+            unlock_pos_error_m = np.array([params.ins_drift * 1000, params.ins_drift * 1000, params.ins_drift * 1000])
+            errors_total = unlock_pos_error
+            errors_m_total = unlock_pos_error_m
+        else:
+            # 不存在未失锁干扰源
+            if lock_num > 0:
+                errors_total = lock_errors_total
+                errors_m_total = lock_errors_m_total
+
+        errors.append(errors_total)
+        errors_m.append(errors_m_total)
+        error_positions.append(target_pos + errors_total)
+        sigma_jdll_list.append(sigma_jdll_total/len(params.jammers))  # 平均码跟踪误差
+        unlock_flags.append(unlock_flag_final)
+        if unlock_flag_final:
+            unlock_ts.append(unlock_flag_final)
+        cnr_list.append(C_NJ_dB_total/len(params.jammers))  # 平均载噪比
+        c_nj_flags.append(c_nj_flag_final)
+        js_ratio_list.append(J_S_dB_total/len(params.jammers))  # 平均干信比
         
 
     # 转换为numpy数组
