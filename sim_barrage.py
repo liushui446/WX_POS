@@ -91,16 +91,22 @@ class SimParams:
         types = ['continuous_wave', 'continuous_wave', 'continuous_wave']
         bandwidths = [20e6, 1e6, 1e6, 10e6, 5e6]
         self.jammers = []
-        for i, ang in enumerate(angles):
-            lon = center_lon + spread_deg * math.cos(ang)
-            lat = center_lat + spread_deg * math.sin(ang)
-            alt = center_alt + 7 # 使用与轨迹中心相近高度
-            jammer = {'pos': np.array([lon, lat, alt]), 'power': powers[i], 'type': types[i], 'bandwidth': bandwidths[i], 'freq': self.fc }
-            if types[i] == 'pulsed':
-                jammer.update({'pulse_width': 5e-6, 'pulse_period': 1e-3, 'duty': 0.005})
-            self.jammers.append(jammer)
+        jammer = {'pos': np.array([120.0, 27.63, 8.3]), 'power': powers[0], 'type': types[0], 'bandwidth': bandwidths[0], 'freq': self.fc }
+        self.jammers.append(jammer)
 
-        # self.jammers[0]['pos'] = np.array([119.75, 27.64, 8.3])  # 微调第一个干扰源位置
+        # for i, ang in enumerate(angles):
+        #     lon = center_lon + spread_deg * math.cos(ang)
+        #     lat = center_lat + spread_deg * math.sin(ang)
+        #     alt = center_alt + 7 # 使用与轨迹中心相近高度
+        #     jammer = {'pos': np.array([lon, lat, alt]), 'power': powers[i], 'type': types[i], 'bandwidth': bandwidths[i], 'freq': self.fc }
+        #     if types[i] == 'pulsed':
+        #         jammer.update({'pulse_width': 5e-6, 'pulse_period': 1e-3, 'duty': 0.005})
+        #     self.jammers.append(jammer)
+
+        # # self.jammers[0]['pos'] = np.array([119.75, 27.64, 8.3])  # 微调第一个干扰源位置
+        # self.jammers[0]['pos'] = np.array([120.25, 28.0, 8.3])
+        # self.jammers[1]['pos'] = np.array([119.75, 27.64, 8.3])
+        # self.jammers[2]['pos'] = np.array([120.0, 27.63, 8.3])
         
         # 导航装备参数
         self.combined_nav = "loose"  # 组合导航方式：loose/tight/deep（松/紧/深耦合）
@@ -413,9 +419,10 @@ def visualize_results(true_traj, error_traj, errors_m, cnr_list, unlock_flags, c
     plt.plot(true_traj[:, 0], true_traj[:, 1], 'g-', label='预定轨迹', linewidth=2)
     plt.plot(error_traj[:, 0], error_traj[:, 1], 'r-', label='受干扰轨迹', linewidth=2)
     # 绘制所有干扰源
-    # for j in params.jammers:
-    #     plt.scatter(j['pos'][0], j['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({j.get('type','')})")
-    plt.scatter(params.jammers[0]['pos'][0], params.jammers[0]['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({params.jammers[0].get('type','')})")
+    for j in params.jammers:
+        plt.scatter(j['pos'][0], j['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({j.get('type','')})")
+    # 单个干扰源绘制
+    # plt.scatter(params.jammers[0]['pos'][0], params.jammers[0]['pos'][1], c='blue', marker='x', s=100, label=f"干扰源 ({params.jammers[0].get('type','')})")
     # 打印干扰源位置
     print(f"干扰源{1}：位置 = {params.jammers[0]['pos'][0]}, {params.jammers[0]['pos'][1]}, {params.jammers[0]['pos'][2]}")
     
@@ -501,6 +508,7 @@ def main_simulation():
     c_nj_flags = []        # 载噪比有效标志序列
     js_ratio_list = []     # 干信比序列
     sigma_jdll_list = []   # 码环误差序列
+    unlock_st_end = []    # 失锁时间段记录
     
     # 仿真主循环
     for t in range(time_steps):
@@ -546,7 +554,7 @@ def main_simulation():
             J_S, J_S_dB = calc_jammer_to_signal_ratio(target_pos, params, Pj, cnt)
 
             c_nj_flag = False
-            if C_NJ_dB < 40:  # 干扰有效（载噪比低于正常阈值） 原来是30
+            if C_NJ_dB < 80:  # 干扰有效（载噪比低于正常阈值） 原来是30
                 # C_NJ_dB_ = 20
                 # 标记干扰有效
                 c_nj_flag = True
