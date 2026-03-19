@@ -13,7 +13,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # ====================== 全局基础参数 ======================
 R_EARTH = 6378137.0          # 修正回标准地球半径
-WINDOW_RANGE = 60
+WINDOW_RANGE = 80            # 稍微加大窗口范围，方便观察拐弯
 TRANSITION_SPEED = 0.08       # 稍微调快过渡，方便观察速度变化
 COLLISION_RADIUS = 4.0
 MAX_COLLISION_ITER = 15
@@ -50,7 +50,6 @@ class UUVNode:
     rel_y: float = 0.0
     target_x: float = 0.0
     target_y: float = 0.0
-    # 【新增】保存上一时刻相对位置，用于计算相对速度
     last_rel_x: float = 0.0
     last_rel_y: float = 0.0
 
@@ -98,7 +97,6 @@ class UUVFormationSimulator:
                                       self.config.init_speed, self.config.init_heading))
         self._set_target_formation()
         self._set_initial_position()
-        # 【新增】初始化 last_rel
         for node in self.nodes:
             node.last_rel_x = node.rel_x
             node.last_rel_y = node.rel_y
@@ -196,8 +194,8 @@ class UUVFormationSimulator:
                 "id": node.id,
                 "lon": round(node.lon, 6),
                 "lat": round(node.lat, 6),
-                "speed": round(node.speed, 3),       # 现在是动态的
-                "heading": round(node.heading, 3),   # 现在是动态的
+                "speed": round(node.speed, 3),
+                "heading": round(node.heading, 3),
                 "rel_x": round(node.rel_x, 3),
                 "rel_y": round(node.rel_y, 3),
                 "target_x": round(node.target_x, 3),
@@ -241,35 +239,17 @@ class UUVFormationSimulator:
         elif f == "triangle":
             res = []
             idx = 0
-            # 【优化】明确：主节点是第1行(Row 1)，从节点从第2行(Row 2)开始
-            current_row = 2  # 从第2行开始生成从节点
-            
+            current_row = 2
             while idx < cnt:
-                # 规则：第 k 行有 k 个节点（主节点Row1=1个，Row2=2个，Row3=3个...）
                 nodes_in_current_row = current_row
-                
-                # 1. 计算Y坐标：
-                # 主节点(Row1)在 y=0
-                # Row2 在 y = -1 * d * 1.2
-                # Row3 在 y = -2 * d * 1.2
-                # 以此类推：y = -(current_row - 1) * d * 1.2
                 y = -(current_row - 1) * d * 1.2
-                
-                # 2. 计算X偏移量：保证该行左右居中对齐主节点
-                # 公式：-(节点数-1) * 间距 / 2
                 x_offset = -(nodes_in_current_row - 1) * d / 2.0
-                
-                # 3. 生成该行的所有从节点
                 for col in range(nodes_in_current_row):
-                    if idx >= cnt:
-                        break  # 从节点够了就停止
+                    if idx >= cnt: break
                     x = x_offset + col * d
                     res.append((x, y))
                     idx += 1
-                
-                # 进入下一行
                 current_row += 1
-            
             return res
         return []
 
@@ -291,7 +271,7 @@ class UUVFormationSimulator:
         main = self.nodes[0]
         dt = self.config.sim_step
 
-        # 1. 更新主节点（保持原逻辑）
+        # 1. 更新主节点
         current_v_main = self.config.init_speed + self.config.acceleration * self.current_time
         current_v_main = max(0.1, current_v_main)
         
@@ -317,36 +297,28 @@ class UUVFormationSimulator:
         # 3. 运动学解算：更新从节点
         for node in self.nodes[1:]:
             # 3.1 计算相对速度 (在局部坐标系下)
-            # V_rel = (Current_rel - Last_rel) / dt
             v_rel_x = (node.rel_x - node.last_rel_x) / dt
             v_rel_y = (node.rel_y - node.last_rel_y) / dt
 
             # 3.2 坐标旋转：将相对速度旋转到全局坐标系
-            # 旋转矩阵 R(theta): [cos, -sin; sin, cos]
             v_rel_x_g = v_rel_x * math.cos(main_hdg_rad) - v_rel_y * math.sin(main_hdg_rad)
             v_rel_y_g = v_rel_x * math.sin(main_hdg_rad) + v_rel_y * math.cos(main_hdg_rad)
 
             # 3.3 速度合成：绝对速度 = 牵连速度(主) + 相对速度
-            # 主节点牵连速度向量
             v_main_x_g = current_v_main * math.sin(main_hdg_rad)
             v_main_y_g = current_v_main * math.cos(main_hdg_rad)
             
-            # 合成
             v_abs_x = v_main_x_g + v_rel_x_g
             v_abs_y = v_main_y_g + v_rel_y_g
 
             # 3.4 计算期望的航速和航向
             desired_speed = math.hypot(v_abs_x, v_abs_y)
-            # 注意：地理坐标系航向为北偏东，使用 atan2(x, y)
             desired_heading_rad = math.atan2(v_abs_x, v_abs_y)
             desired_heading = math.degrees(desired_heading_rad) % 360.0
 
             # 3.5 物理约束平滑
-            # 航速限制
             desired_speed = min(desired_speed, MAX_SPEED)
             
-            # 航向限制（防止瞬间掉头）
-            # 计算角度差，归一化到 [-180, 180]
             heading_diff = desired_heading - node.heading
             heading_diff = (heading_diff + 180) % 360 - 180
             
@@ -358,12 +330,12 @@ class UUVFormationSimulator:
             node.speed = desired_speed
             node.heading = desired_heading % 360.0
 
-            # 3.7 更新从节点地理坐标（基于主节点+相对位置，比积分速度更准）
+            # 3.7 更新从节点地理坐标
             rx = node.rel_x * math.cos(main_hdg_rad) - node.rel_y * math.sin(main_hdg_rad)
             ry = node.rel_x * math.sin(main_hdg_rad) + node.rel_y * math.cos(main_hdg_rad)
             node.lon, node.lat = self._enu2geo(rx, ry, main.lon, main.lat)
 
-            # 3.8 保存当前相对位置，用于下一帧计算
+            # 3.8 保存当前相对位置
             node.last_rel_x = node.rel_x
             node.last_rel_y = node.rel_y
 
@@ -373,13 +345,13 @@ class UUVFormationSimulator:
         self._record_transition_step()
         return self.nodes
 
-# ====================== 可视化渲染类（增强：显示航向航速） ======================
+# ====================== 可视化渲染类 ======================
 class FormationVisualizer:
     def __init__(self, sim: UUVFormationSimulator):
         self.sim = sim
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
         self.ax.set_aspect('equal')
-        self.ax.set_title("UUV 集群编队（含运动学解算：航向/航速动态变化）", fontsize=14)
+        self.ax.set_title("UUV 集群编队（含运动学解算 + 拐弯航行）", fontsize=14)
         self.ax.grid(True, alpha=0.3)
 
     def update_frame(self, frame):
@@ -430,15 +402,23 @@ def input_worker(sim: UUVFormationSimulator):
         except:
             continue
 
+# ====================== 主函数（仅修改了这里） ======================
 def main():
     config = FormationConfig(
         formation_type="line",
-        node_num=10,
+        node_num=9,
         main_lon=120.0,
         main_lat=30.0,
         rel_distance=10.0,
         init_speed=2.0,
-        init_heading=0.0
+        init_heading=0.0,
+        # ====================== 【关键修改】设置拐弯半径 ======================
+        # float('inf') = 直线
+        # 150.0 = 以150米为半径向左做圆周运动（逆时针拐弯）
+        # -150.0 = 向右拐弯（顺时针）
+        turn_radius=150.0, 
+        acceleration=0.0,
+        sim_step=0.1
     )
 
     try:
