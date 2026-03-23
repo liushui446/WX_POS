@@ -56,6 +56,7 @@ class UUVNode:
 @dataclass
 class FormationConfig:
     formation_type: str
+    old_num: int
     node_num: int
     main_lon: float
     main_lat: float
@@ -90,7 +91,7 @@ class UUVFormationSimulator:
         self._init_nodes()
 
     def _validate_config(self):
-        if not (4 <= self.config.node_num <= 10): raise ValueError(f"总节点数需4~10，当前：{self.config.node_num}")
+        if not (2 <= self.config.node_num <= 10): raise ValueError(f"总节点数需2~10，当前：{self.config.node_num}")
         if self.config.rel_distance <= 0: raise ValueError("节点间距必须>0")
 
     def _init_nodes(self):
@@ -126,6 +127,33 @@ class UUVFormationSimulator:
             self.transition_data = []
             print(f"\n✅ 切换队形：{self.last_formation} → {new_form}，开始记录...")
 
+    # ====================== 【关键修改】智能切换：同数平滑 / 异数跳变 ======================
+    def switch_formation_and_count(self, formation_name: str, new_count: int):
+        valid_forms = ["line", "rect", "circle", "diamond", "triangle"]
+        if formation_name not in valid_forms:
+            print(f"❌ 无效队形：{formation_name}")
+            return
+        if not (3 <= new_count <= 10):
+            print(f"❌ 节点数必须 4~10")
+            return
+
+        self.old_num = self.config.node_num
+        self.last_formation = self.config.formation_type
+        self.config.formation_type = formation_name
+        self.config.node_num = new_count
+
+        # ====================== 核心逻辑 ======================
+        if new_count == self.old_num:
+            # 节点数相同 → 平滑过渡
+            self.switch_formation(str(new_count))
+            print(f"✅ 切换：{self.last_formation} → {formation_name} | 节点数不变，平滑过渡")
+        else:
+            # 节点数不同 → 直接到达目标位置
+            # 重新初始化节点
+            self._init_nodes()
+            print(f"✅ 切换：{self.last_formation} → {formation_name} | 节点数变化，直接就位")
+        # ======================================================
+    
     def _set_target_formation(self):
         slave_count = len(self.nodes) - 1
         if slave_count <= 0: return
@@ -217,44 +245,144 @@ class UUVFormationSimulator:
             print(f"✅ 变换完成！共 {len(self.transition_data)} 步，已写入 trans.json")
 
     def _generate_formation_positions(self, cnt: int) -> List[Tuple[float, float]]:
-        if not (3 <= cnt <=9): raise ValueError(f"从节点必须3~9，当前：{cnt}")
+        if not (3 <= (cnt+1) <=10): raise ValueError(f"从节点必须3~10，当前：{cnt}")
         d = self.config.rel_distance
         f = self.config.formation_type
         if f == "line": return [(0.0, -i*d) for i in range(1,cnt+1)]
         elif f == "rect":
-            m = {3:(2,2),4:(2,2),5:(2,3),6:(2,3),7:(3,3),8:(3,3),9:(3,3)}
-            rows,cols = m[cnt]; ox=-(cols-1)*d/2; oy=-d; r=[]; idx=0
-            for i in range(rows):
-                y = oy -i*d
-                for j in range(cols):
-                    if idx>=cnt:break
-                    r.append((ox+j*d, y)); idx+=1
+            r = []
+            num = cnt+1
+            if num == 4:
+                r = [(d, 0), (d, -d), (0, -d)]
+            elif num == 5:
+                r = [(-d, d), (-d, -d), (d, d), (d, -d)]
+            elif num == 6:
+                r = [(-d, 0), (d, 0), (-d, -d), (0, -d), (d, -d)]
+            elif num == 7:
+                r = [(-d, 0), (d, 0), (0, -d), (-d, -2*d), (0, -2*d), (d, -2*d)]
+            elif num == 8:
+                r = [(-d, 0), (d, 0), (-d, -d), (d, -d), (-d, -2*d), (0, -2*d), (d, -2*d)]
+            elif num == 9:
+                r = [(-d, 0), (d, 0), (-d, -d), (0, -d), (d, -d), (-d, -2*d), (0, -2*d), (d, -2*d)]
+            elif num == 10:
+                r = [(-2*d,0),(-d,0),(d,0),(2*d,0), (-2*d,-d),(-d,-d),(0,-d),(d,-d),(2*d,-d)]
             return r
         elif f == "circle":
             r = d*2; return [(r*math.sin(2*math.pi*i/cnt), r*math.cos(2*math.pi*i/cnt)) for i in range(cnt)]
         elif f == "diamond":
-            m = {3:[2,1],4:[2,2],5:[2,2,1],6:[2,2,2],7:[2,3,2],8:[2,4,2],9:[2,4,2,1]}
-            rows = m[cnt]; r=[]; idx=0
-            for i,n in enumerate(rows):
-                y = -(i+1)*d; ox=-(n-1)*d/2
-                for j in range(n):
-                    if idx>=cnt:break
-                    r.append((ox+j*d, y)); idx+=1
+            r = []
+            d = self.config.rel_distance
+            num = cnt+1
+            # cnt = 从节点数量，总节点数 = cnt+1
+            if num == 4:
+                # 总4节点：主在上顶点 → 从：左、下、右
+                r = [
+                    (-d, 0),    # 左
+                    (0, -d),    # 下
+                    (d, 0)      # 右
+                ]
+            elif num == 5:
+                # 总5节点：主在中心 → 从：上、左、右、下
+                r = [
+                    (0, d),     # 上
+                    (-d, 0),    # 左
+                    (d, 0),     # 右
+                    (0, -d)     # 下
+                ]
+            elif num == 6:
+                # 总6节点：排1(主1)、排2(4)、排3(1) → 从5个
+                r = [
+                    (-2*d, 0), (-d, 0), (d, 0), (2*d, 0),  # 排2
+                    (0, -d)                                # 排3
+                ]
+            elif num == 7:
+                # 总7节点：排1(主1)、排2(1)、排3(3)、排4(1)、排5(1) → 从6个
+                r = [
+                    (0, -d),                   # 排2
+                    (-d, -2*d), (0, -2*d), (d, -2*d),  # 排3
+                    (0, -3*d),                 # 排4
+                    (0, -4*d)                  # 排5
+                ]
+            elif num == 8:
+                # 总8节点：排1(主1)、排2(2)、排3(2)、排4(2)、排5(1) → 从7个
+                r = [
+                    (-d/2, -d), (d/2, -d),     # 排2
+                    (-d, -2*d), (d, -2*d),     # 排3
+                    (-d/2, -3*d), (d/2, -3*d), # 排4
+                    (0, -4*d)                  # 排5
+                ]
+            elif num == 9:
+                # 总9节点：排1(主1)、排2(2)、排3(3)、排4(2)、排5(1) → 从8个
+                r = [
+                    (-d/2, -d), (d/2, -d),            # 排2
+                    (-d, -2*d), (0, -2*d), (d, -2*d), # 排3
+                    (-d/2, -3*d), (d/2, -3*d),        # 排4
+                    (0, -4*d)                         # 排5
+                ]
+            elif num == 10:
+                # 总10节点：排1(主1)、排2(2)、排3(4)、排4(2)、排5(1) → 从9个
+                r = [
+                    (-d/2, -d), (d/2, -d),                      # 排2
+                    (-1.5*d, -2*d), (-0.5*d, -2*d), (0.5*d, -2*d), (1.5*d, -2*d), # 排3
+                    (-d/2, -3*d), (d/2, -3*d),                  # 排4
+                    (0, -4*d)                                   # 排5
+                ]
             return r
         elif f == "triangle":
             res = []
-            idx = 0
-            current_row = 2
-            while idx < cnt:
-                nodes_in_current_row = current_row
-                y = -(current_row - 1) * d * 1.2
-                x_offset = -(nodes_in_current_row - 1) * d / 2.0
-                for col in range(nodes_in_current_row):
-                    if idx >= cnt: break
-                    x = x_offset + col * d
-                    res.append((x, y))
-                    idx += 1
-                current_row += 1
+            d = self.config.rel_distance
+            num = cnt+1
+            # cnt = 从节点数量（总节点数 = cnt+1）
+            if num == 3:
+                # 总节点3个：主在上顶点 → 从：左下、右下
+                res = [
+                    (-d, -d),       # 左下
+                    (d, -d)         # 右下
+                ]
+            elif num == 4:
+                # 总节点4个：主在中心 → 从：上、左下、右下
+                res = [
+                    (0, d),         # 上顶点
+                    (-d, -d),       # 左下
+                    (d, -d)         # 右下
+                ]
+            elif num == 5:
+                # 总节点5个：主中心 → 上、左下、右下 + 第2排中间1个
+                res = [
+                    (-d/2, -d), (d/2, -d),            # 排2
+                    (-d, -2*d), (d, -2*d) # 排3   
+                ]
+            elif num == 6:
+                # 总节点6个：排1(1主)、排2(2)、排3(3) → 从共5个
+                res = [
+                    (-d/2, -d), (d/2, -d),            # 排2
+                    (-d, -2*d),  (0, -2*d), (d, -2*d) # 排3
+                ]
+            elif num == 7:
+                # 总节点7个：排1(1)、排2(2)、排3(4) → 从共6个
+                res = [
+                    (-d/2, -d), (d/2, -d),                      # 排2
+                    (-1.5*d, -2*d), (-0.5*d, -2*d), (0.5*d, -2*d), (1.5*d, -2*d) # 排3
+                ]
+            elif num == 8:
+                # 总节点8个：排1(1)、排2(3)、排3(4) → 从共7个
+                res = [
+                    (-d, -d),  (0, -d),  (d, -d),              # 排2
+                    (-1.5*d, -2*d), (-0.5*d, -2*d), (0.5*d, -2*d), (1.5*d, -2*d) # 排3
+                ]
+            elif num == 9:
+                # 总节点9个：排1(1)、排2(3)、排3(5) → 从共8个
+                res = [
+                    (-d, -d),  (0, -d),  (d, -d),              # 排2
+                    (-2*d, -2*d), (-d, -2*d), (0, -2*d), (d, -2*d), (2*d, -2*d) # 排3
+                ]
+            elif num == 10:
+                # 总节点10个：4排：1 + 2 + 3 + 4 → 从共9个
+                res = [
+                    (-d/2, -d), (d/2, -d),            # 排2
+                    (-d, -2*d),  (0, -2*d), (d, -2*d), # 排3
+                    (-1.5*d, -3*d), (-0.5*d, -3*d), (0.5*d, -3*d), (1.5*d, -3*d) # 排4
+                ]
             return res
         return []
 
@@ -271,74 +399,77 @@ class UUVFormationSimulator:
         dlat = y/R_EARTH
         return math.degrees(rlr+dlon), math.degrees(rla+dlat)
 
-    # ====================== 【核心修改】基于航向变化率的更新 ======================
+    # ====================== 【核心修改】真实编队圆弧转弯 + 整体旋转 ======================
     def _update_maneuver(self):
         main = self.nodes[0]
         dt = self.config.sim_step
 
-        # 1. 更新主节点（使用 heading_rate 直接积分）
+        # 1. 更新主节点
         current_v_main = self.config.init_speed + self.config.acceleration * self.current_time
         current_v_main = max(0.1, current_v_main)
         
-        # 【修改】直接累加航向变化率
-        # 新航向 = 旧航向 + 航向变化率 * 时间步长
+        # 航向积分
         main.heading = (main.heading + self.config.heading_rate * dt) % 360.0
         main_hdg_rad = math.radians(main.heading)
         main.speed = current_v_main
 
-        # 主节点位移增量
-        dx_main_global = current_v_main * math.sin(main_hdg_rad) * dt
-        dy_main_global = current_v_main * math.cos(main_hdg_rad) * dt
-        main.lon, main.lat = self._enu2geo(dx_main_global, dy_main_global, main.lon, main.lat)
+        # 主节点位移
+        dx_main = current_v_main * math.sin(main_hdg_rad) * dt
+        dy_main = current_v_main * math.cos(main_hdg_rad) * dt
+        main.lon, main.lat = self._enu2geo(dx_main, dy_main, main.lon, main.lat)
 
-        # 2. 队形过渡 + 避碰
-        self._transition_formation()
+        # 2. 队形渐变 + 避碰
+        if self.is_transition:
+            self._transition_formation()
         self.apply_collision_avoidance()
 
-        # 3. 运动学解算：更新从节点
+        # 3. 角速度（弧度/秒）
+        yaw_rate_deg = self.config.heading_rate
+        w = math.radians(yaw_rate_deg)
+
+        # 4. 逐个从节点：速度分配 + 位置旋转（整体队形倾斜）
         for node in self.nodes[1:]:
-            # 3.1 计算相对速度
-            v_rel_x = (node.rel_x - node.last_rel_x) / dt
-            v_rel_y = (node.rel_y - node.last_rel_y) / dt
+            rx = node.rel_x  # 相对主节点的机体坐标系坐标
+            ry = node.rel_y
 
-            # 3.2 坐标旋转
-            v_rel_x_g = v_rel_x * math.cos(main_hdg_rad) - v_rel_y * math.sin(main_hdg_rad)
-            v_rel_y_g = v_rel_x * math.sin(main_hdg_rad) + v_rel_y * math.cos(main_hdg_rad)
+            # ---------------------------
+            # 关键：转弯时内外侧速度分配
+            # ---------------------------
+            if abs(w) < 1e-4:
+                # 直行：速度 = 主节点速度
+                des_vx = current_v_main * math.sin(main_hdg_rad)
+                des_vy = current_v_main * math.cos(main_hdg_rad)
+            else:
+                # 转弯：外侧快、内侧慢
+                v_rel_x = -w * ry
+                v_rel_y =  w * rx
+                des_vx = current_v_main * math.sin(main_hdg_rad) + v_rel_x
+                des_vy = current_v_main * math.cos(main_hdg_rad) + v_rel_y
 
-            # 3.3 速度合成
-            v_main_x_g = current_v_main * math.sin(main_hdg_rad)
-            v_main_y_g = current_v_main * math.cos(main_hdg_rad)
-            
-            v_abs_x = v_main_x_g + v_rel_x_g
-            v_abs_y = v_main_y_g + v_rel_y_g
+            # 期望航速、航向
+            desired_speed = math.hypot(des_vx, des_vy)
+            desired_heading = math.degrees(math.atan2(des_vx, des_vy)) % 360.0
 
-            # 3.4 计算期望的航速和航向
-            desired_speed = math.hypot(v_abs_x, v_abs_y)
-            desired_heading_rad = math.atan2(v_abs_x, v_abs_y)
-            desired_heading = math.degrees(desired_heading_rad) % 360.0
-
-            # 3.5 物理约束平滑
+            # 限幅
             desired_speed = min(desired_speed, MAX_SPEED)
-            
-            heading_diff = desired_heading - node.heading
-            heading_diff = (heading_diff + 180) % 360 - 180
-            
-            max_turn_this_step = MAX_TURN_RATE * dt
-            if abs(heading_diff) > max_turn_this_step:
-                desired_heading = node.heading + math.copysign(max_turn_this_step, heading_diff)
 
-            # 3.6 更新从节点状态
+            # 更新节点速度与航向
             node.speed = desired_speed
-            node.heading = desired_heading % 360.0
+            node.heading = desired_heading
 
-            # 3.7 更新从节点地理坐标
-            rx = node.rel_x * math.cos(main_hdg_rad) - node.rel_y * math.sin(main_hdg_rad)
-            ry = node.rel_x * math.sin(main_hdg_rad) + node.rel_y * math.cos(main_hdg_rad)
-            node.lon, node.lat = self._enu2geo(rx, ry, main.lon, main.lat)
+            # ---------------------------
+            # 关键：整体队形旋转（倾斜）
+            # 把相对坐标旋转到主节点当前航向 → 实现编队倾斜
+            # ---------------------------
+            x_world = rx * math.cos(main_hdg_rad) - ry * math.sin(main_hdg_rad)
+            y_world = rx * math.sin(main_hdg_rad) + ry * math.cos(main_hdg_rad)
 
-            # 3.8 保存当前相对位置
-            node.last_rel_x = node.rel_x
-            node.last_rel_y = node.rel_y
+            # 用旋转后的全局相对位置计算经纬
+            node.lon, node.lat = self._enu2geo(x_world, y_world, main.lon, main.lat)
+
+            # 保存上一帧位置
+            node.last_rel_x = rx
+            node.last_rel_y = ry
 
     def step_simulation(self):
         self.current_time += self.config.sim_step
@@ -403,10 +534,35 @@ def input_worker(sim: UUVFormationSimulator):
         except:
             continue
 
+# def input_worker(sim: UUVFormationSimulator):
+#     print("\n===== 编队切换命令（格式：队形 节点数）=====")
+#     print("示例：")
+#     print("  rect 6    → 矩形6节点")
+#     print("  line 8    → 直线8节点")
+#     print("可选：line, rect, circle, diamond, triangle")
+#     print("=============================================\n")
+    
+#     while True:
+#         try:
+#             line = input(">> 输入命令：").strip()
+#             if not line: continue
+#             parts = line.split()
+#             if len(parts) != 2:
+#                 print("❌ 格式：队形 节点数")
+#                 continue
+#             form_name = parts[0].lower()
+#             new_cnt = int(parts[1])
+#             sim.switch_formation_and_count(form_name, new_cnt)
+#         except ValueError:
+#             print("❌ 节点数必须是数字")
+#         except Exception as e:
+#             print(f"❌ 错误：{e}")
+
 # ====================== 主函数 ======================
 def main():
     config = FormationConfig(
         formation_type="line",
+        old_num=8,
         node_num=8,
         main_lon=120.0,
         main_lat=30.0,
@@ -417,7 +573,7 @@ def main():
         # 0.0 = 直线航行
         # 5.0 = 以每秒5度的速率逆时针左转
         # -5.0 = 以每秒5度的速率顺时针右转
-        heading_rate=0.0, 
+        heading_rate=1.0, 
         acceleration=0.0,
         sim_step=0.1
     )
