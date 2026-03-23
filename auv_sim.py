@@ -12,17 +12,17 @@ plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ====================== 全局基础参数 ======================
-R_EARTH = 6378137.0          # 修正回标准地球半径
-WINDOW_RANGE = 80            # 稍微加大窗口范围，方便观察拐弯
-TRANSITION_SPEED = 0.08       # 稍微调快过渡，方便观察速度变化
+R_EARTH = 6378137.0
+WINDOW_RANGE = 80
+TRANSITION_SPEED = 0.08
 COLLISION_RADIUS = 4.0
 MAX_COLLISION_ITER = 15
 MAX_ADJUST_STEP = 1.0
 ERROR_STABLE_THRESHOLD = 0.02
 
-# ====================== 【新增】运动学物理约束 ======================
-MAX_SPEED = 5.0          # 最大航速 (m/s)
-MAX_TURN_RATE = 45.0     # 最大转向速率 (度/秒)，防止瞬间掉头
+# ====================== 运动学物理约束 ======================
+MAX_SPEED = 5.0
+MAX_TURN_RATE = 45.0     # 物理上的最大转向速率限制 (度/秒)
 
 # ====================== 数据结构定义 ======================
 @dataclass
@@ -62,7 +62,12 @@ class FormationConfig:
     rel_distance: float
     init_speed: float
     init_heading: float
-    turn_radius: float = float('inf')
+    # ====================== 【修改】将 turn_radius 改为 heading_rate ======================
+    # heading_rate: 航向变化率 (度/秒)
+    # 正数 = 逆时针左转 (Counter-Clockwise)
+    # 负数 = 顺时针右转 (Clockwise)
+    # 0 = 直线航行
+    heading_rate: float = 0.0      
     acceleration: float = 0.0
     sim_step: float = 0.1
     output_interval: float = 1.0
@@ -119,7 +124,7 @@ class UUVFormationSimulator:
             self._set_target_formation()
             self.is_transition = True
             self.transition_data = []
-            print(f"\n✅ 切换队形：{self.last_formation} → {new_form}，开始记录（注意观察JSON中speed/heading变化）...")
+            print(f"\n✅ 切换队形：{self.last_formation} → {new_form}，开始记录...")
 
     def _set_target_formation(self):
         slave_count = len(self.nodes) - 1
@@ -266,23 +271,19 @@ class UUVFormationSimulator:
         dlat = y/R_EARTH
         return math.degrees(rlr+dlon), math.degrees(rla+dlat)
 
-    # ====================== 【核心重写】基于运动学的状态更新 ======================
+    # ====================== 【核心修改】基于航向变化率的更新 ======================
     def _update_maneuver(self):
         main = self.nodes[0]
         dt = self.config.sim_step
 
-        # 1. 更新主节点
+        # 1. 更新主节点（使用 heading_rate 直接积分）
         current_v_main = self.config.init_speed + self.config.acceleration * self.current_time
         current_v_main = max(0.1, current_v_main)
         
-        if self.config.turn_radius != float('inf'):
-            omega = current_v_main / self.config.turn_radius
-            turn_angle = omega * self.current_time
-        else:
-            turn_angle = 0.0
-        
-        main_hdg_rad = math.radians(self.config.init_heading) + turn_angle
-        main.heading = math.degrees(main_hdg_rad) % 360.0
+        # 【修改】直接累加航向变化率
+        # 新航向 = 旧航向 + 航向变化率 * 时间步长
+        main.heading = (main.heading + self.config.heading_rate * dt) % 360.0
+        main_hdg_rad = math.radians(main.heading)
         main.speed = current_v_main
 
         # 主节点位移增量
@@ -296,15 +297,15 @@ class UUVFormationSimulator:
 
         # 3. 运动学解算：更新从节点
         for node in self.nodes[1:]:
-            # 3.1 计算相对速度 (在局部坐标系下)
+            # 3.1 计算相对速度
             v_rel_x = (node.rel_x - node.last_rel_x) / dt
             v_rel_y = (node.rel_y - node.last_rel_y) / dt
 
-            # 3.2 坐标旋转：将相对速度旋转到全局坐标系
+            # 3.2 坐标旋转
             v_rel_x_g = v_rel_x * math.cos(main_hdg_rad) - v_rel_y * math.sin(main_hdg_rad)
             v_rel_y_g = v_rel_x * math.sin(main_hdg_rad) + v_rel_y * math.cos(main_hdg_rad)
 
-            # 3.3 速度合成：绝对速度 = 牵连速度(主) + 相对速度
+            # 3.3 速度合成
             v_main_x_g = current_v_main * math.sin(main_hdg_rad)
             v_main_y_g = current_v_main * math.cos(main_hdg_rad)
             
@@ -351,7 +352,7 @@ class FormationVisualizer:
         self.sim = sim
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
         self.ax.set_aspect('equal')
-        self.ax.set_title("UUV 集群编队（含运动学解算 + 拐弯航行）", fontsize=14)
+        self.ax.set_title("UUV 集群编队（航向变化率控制）", fontsize=14)
         self.ax.grid(True, alpha=0.3)
 
     def update_frame(self, frame):
@@ -375,13 +376,13 @@ class FormationVisualizer:
 
         self.ax.scatter(xs, ys, c=colors, s=100, alpha=1.0)
         
-        # 标注：ID + 航向 + 航速
         for i, node in enumerate(nodes):
             label = f"ID{node.id}\n{node.heading:.0f}°\n{node.speed:.1f}m/s"
             self.ax.annotate(label, (xs[i], ys[i]), fontsize=8, color='white',
                              bbox=dict(boxstyle="round", fc="black", alpha=0.7))
 
-        info = f"队形: {self.sim.config.formation_type} | 主节点: {main.lon:.6f}, {main.lat:.6f}"
+        # 显示当前的航向变化率
+        info = f"队形: {self.sim.config.formation_type} | 航向变化率: {self.sim.config.heading_rate:.1f}°/s"
         self.ax.text(0.01, 0.98, info, transform=self.ax.transAxes, fontsize=10,
                      verticalalignment='top', bbox=dict(boxstyle="round", facecolor='black', alpha=0.7), color='cyan')
         return self.ax,
@@ -402,21 +403,21 @@ def input_worker(sim: UUVFormationSimulator):
         except:
             continue
 
-# ====================== 主函数（仅修改了这里） ======================
+# ====================== 主函数 ======================
 def main():
     config = FormationConfig(
         formation_type="line",
-        node_num=9,
+        node_num=8,
         main_lon=120.0,
         main_lat=30.0,
         rel_distance=10.0,
         init_speed=2.0,
         init_heading=0.0,
-        # ====================== 【关键修改】设置拐弯半径 ======================
-        # float('inf') = 直线
-        # 150.0 = 以150米为半径向左做圆周运动（逆时针拐弯）
-        # -150.0 = 向右拐弯（顺时针）
-        turn_radius=150.0, 
+        # ====================== 【关键配置】航向变化率 ======================
+        # 0.0 = 直线航行
+        # 5.0 = 以每秒5度的速率逆时针左转
+        # -5.0 = 以每秒5度的速率顺时针右转
+        heading_rate=0.0, 
         acceleration=0.0,
         sim_step=0.1
     )
