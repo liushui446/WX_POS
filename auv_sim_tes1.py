@@ -1,19 +1,20 @@
 import math
 import threading
-import json
+import time
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Dict
+from concurrent.futures import ThreadPoolExecutor
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ====================== 全局基础参数 ======================
 R_EARTH = 6378137.0
-WINDOW_RANGE = 100
+WINDOW_RANGE = 150
 TRANSITION_SPEED = 0.08
 COLLISION_RADIUS = 4.0
 MAX_COLLISION_ITER = 15
@@ -74,9 +75,10 @@ class FormationConfig:
     sim_step: float = 0.1
     output_interval: float = 1.0
 
-# ====================== 编队仿真核心类 ======================
+# ====================== 编队仿真核心类（单编队，带ID） ======================
 class UUVFormationSimulator:
-    def __init__(self, config: FormationConfig):
+    def __init__(self, config: FormationConfig, formation_id: int):
+        self.formation_id = formation_id  # 编队唯一ID
         self.config = config
         self.nodes: List[UUVNode] = []
         self.current_time = 0.0
@@ -121,17 +123,16 @@ class UUVFormationSimulator:
         if cmd in self.formation_map:
             new_form = self.formation_map[cmd]
             if new_form == self.config.formation_type:
-                print("✅ 当前已是该队形")
+                print(f"✅ 编队[{self.formation_id}] 当前已是该队形")
                 return
             self.last_formation = self.config.formation_type
             self.config.formation_type = new_form
             self._set_target_formation()
             self.is_transition = True
             self.transition_data = []
-            print(f"\n✅ 切换队形：{self.last_formation} → {new_form}")
+            print(f"\n✅ 编队[{self.formation_id}] 切换队形：{self.last_formation} → {new_form}")
 
     def _set_target_formation(self):
-        # 正常编队节点
         valid_slaves = [n for n in self.nodes[1:] if not n.is_leaving]
         slave_count = len(valid_slaves)
         positions = self._generate_formation_positions(slave_count)
@@ -139,18 +140,14 @@ class UUVFormationSimulator:
             if i < len(positions):
                 node.target_x, node.target_y = positions[i]
 
-        # ✅【关键】给脱离节点设置它自己的目标（相对于主机）
         for node in self.nodes[1:]:
             if node.is_leaving:
                 node.target_x = node.leave_target_x
                 node.target_y = node.leave_target_y
-                # print("脱离点消失位置更新为：", node.target_x, node.target_y)
 
-    # ====================== 【支持批量添加节点】核心修改 ======================
     def add_node(self, lon: float, lat: float, speed: float, heading: float, join_frames: int = 60):
-        """ 单个添加（兼容旧接口） """
         if len(self.nodes) >= 10:
-            print("❌ 已达到最大节点数10个，无法添加")
+            print(f"❌ 编队[{self.formation_id}] 已达到最大节点数10个，无法添加")
             return False
 
         self.max_id += 1
@@ -162,23 +159,21 @@ class UUVFormationSimulator:
             join_total_frames=join_frames, join_progress=0.0
         )
         self.nodes.append(new_node)
-        print(f"\n✅ 成功添加节点 ID:{self.max_id}")
+        print(f"\n✅ 编队[{self.formation_id}] 成功添加节点 ID:{self.max_id}")
         return True
 
     def add_multiple_nodes(self, add_count: int = 1):
-        """ 一次添加多个节点，自动判断上限 """
         current = len(self.nodes)
         max_allow = 10 - current
         if max_allow <= 0:
-            print("❌ 已达最大节点数 10，无法添加")
+            print(f"❌ 编队[{self.formation_id}] 已达最大节点数 10，无法添加")
             return
 
         add_count = min(add_count, max_allow)
         success = 0
 
-        # 批量添加，位置稍微错开避免重叠
-        base_lon = 120.001
-        base_lat = 30.001
+        base_lon = self.config.main_lon + 0.001
+        base_lat = self.config.main_lat + 0.001
         for i in range(add_count):
             lon = base_lon + i * 0.0001
             lat = base_lat + i * 0.0001
@@ -188,45 +183,35 @@ class UUVFormationSimulator:
         self.config.node_num = len(self.nodes)
         self._set_target_formation()
         self.is_transition = True
-        print(f"✅ 批量添加完成：成功添加 {success} 个节点，当前总节点：{len(self.nodes)}")
+        print(f"✅ 编队[{self.formation_id}] 批量添加完成：成功添加 {success} 个节点，当前总节点：{len(self.nodes)}")
 
-    # ====================== 【支持多节点删除】 ======================
     def remove_random_node(self, remove_count: int = 1):
-        """ 一次删除多个节点 """
-        max_possible_remove = len(self.nodes) - 2  # 至少保留主节点+1个
+        max_possible_remove = len(self.nodes) - 2
         if max_possible_remove <= 0:
-            print("❌ 节点数过少，无法删除")
+            print(f"❌ 编队[{self.formation_id}] 节点数过少，无法删除")
             return
 
-        # 实际可删除数量
         remove_count = min(remove_count, max_possible_remove)
-
-        # 获取所有可删除节点
         slave_nodes = [node for node in self.nodes[1:] if not node.is_leaving]
         if len(slave_nodes) < remove_count:
-            print("❌ 没有足够可删除的节点")
+            print(f"❌ 编队[{self.formation_id}] 没有足够可删除的节点")
             return
 
-        # 取最后 N 个节点开始脱离
         leave_nodes = slave_nodes[-remove_count:]
         main = self.nodes[0]
         leave_dist = self.config.rel_distance * 15.0
 
         for leave_node in leave_nodes:
             leave_node.is_leaving = True
-
-            # ====================== 安全方向：主节点右侧 90° ======================
             opposite_heading = (main.heading + 90.0) % 360.0
             opposite_rad = math.radians(opposite_heading)
             leave_node.leave_target_x = leave_dist * math.sin(opposite_rad)
             leave_node.leave_target_y = leave_dist * math.cos(opposite_rad)
-
-            print(f"\n✅ 节点 ID:{leave_node.id} 开始脱离")
-            print(f"   目标相对位置: ({leave_node.leave_target_x:.1f}, {leave_node.leave_target_y:.1f})")
+            print(f"\n✅ 编队[{self.formation_id}] 节点 ID:{leave_node.id} 开始脱离")
 
         self._set_target_formation()
         self.is_transition = True
-        print(f"\n✅ 已启动 {remove_count} 个节点脱离流程，剩余节点重排中")
+        print(f"\n✅ 编队[{self.formation_id}] 已启动 {remove_count} 个节点脱离流程")
 
     def _transition_formation(self):
         for node in self.nodes[1:]:
@@ -236,14 +221,11 @@ class UUVFormationSimulator:
                 node.rel_y += (node.target_y - node.rel_y) * 0.1
                 if node.join_progress >= 1.0:
                     node.is_joining = False
-                    print(f"✅ 节点 ID:{node.id} 已完全加入编队")
+                    print(f"✅ 编队[{self.formation_id}] 节点 ID:{node.id} 已完全加入编队")
             else:
-                if node.is_leaving:
-                    node.rel_x += (node.target_x - node.rel_x) * TRANSITION_SPEED * 0.6
-                    node.rel_y += (node.target_y - node.rel_y) * TRANSITION_SPEED * 0.6
-                else:
-                    node.rel_x += (node.target_x - node.rel_x) * TRANSITION_SPEED
-                    node.rel_y += (node.target_y - node.rel_y) * TRANSITION_SPEED
+                speed = TRANSITION_SPEED * 0.6 if node.is_leaving else TRANSITION_SPEED
+                node.rel_x += (node.target_x - node.rel_x) * speed
+                node.rel_y += (node.target_y - node.rel_y) * speed
 
     def checkCollision1(self, positions: List[Point2D]) -> List[Point2D]:
         adjusted = [Point2D(p.x, p.y) for p in positions]
@@ -301,7 +283,7 @@ class UUVFormationSimulator:
             has_leaving = any(n.is_leaving for n in self.nodes)
             if not has_leaving:
                 self.is_transition = False
-                print("✅ 编队已稳定")
+                print(f"✅ 编队[{self.formation_id}] 编队已稳定")
 
     def _generate_formation_positions(self, cnt: int) -> List[Tuple[float, float]]:
         d = self.config.rel_distance
@@ -380,9 +362,6 @@ class UUVFormationSimulator:
         self.apply_collision_avoidance()
         w = math.radians(self.config.heading_rate)
 
-        # ==============================================
-        # 【支持多删除】倒序遍历 + 批量删除
-        # ==============================================
         nodes_to_remove = []
         for node in reversed(self.nodes[1:]):
             if node.is_leaving:
@@ -396,13 +375,11 @@ class UUVFormationSimulator:
                         closest_node = n
 
                 if closest_node is not None:
-                    current_dist = math.hypot(closest_node.rel_x - node.rel_x, closest_node.rel_y - node.rel_y)
                     delete_dist = 5 * self.config.rel_distance
-                    if current_dist > delete_dist:
-                        print(f"✅ 节点 ID:{node.id} 已远离编队，消失")
+                    if min_dist > delete_dist:
+                        print(f"✅ 编队[{self.formation_id}] 节点 ID:{node.id} 已远离编队，消失")
                         nodes_to_remove.append(node)
 
-            # 正常节点
             rx, ry = node.rel_x, node.rel_y
             if abs(w) < 1e-4:
                 dvx = current_v_main * math.sin(main_hdg_rad)
@@ -419,7 +396,6 @@ class UUVFormationSimulator:
             wy = rx * math.sin(main_hdg_rad) + ry * math.cos(main_hdg_rad)
             node.lon, node.lat = self._enu2geo(wx, wy, main.lon, main.lat)
 
-        # 批量删除（安全）
         for node in nodes_to_remove:
             if node in self.nodes:
                 self.nodes.remove(node)
@@ -428,38 +404,56 @@ class UUVFormationSimulator:
             self._set_target_formation()
 
     def step_simulation(self):
+        # 单编队仿真步（并行执行）
         self.current_time += self.config.sim_step
         self._update_maneuver()
         self._record_transition_step()
         return self.nodes
 
-# ====================== 可视化 ======================
-class FormationVisualizer:
-    def __init__(self, sim: UUVFormationSimulator):
-        self.sim = sim
-        self.fig, self.ax = plt.subplots(figsize=(9,9))
+# ====================== 多编队管理器（核心：并行计算+ID管理） ======================
+class MultiFormationManager:
+    def __init__(self):
+        self.formations: Dict[int, UUVFormationSimulator] = {}  # {编队ID: 仿真器}
+        self.executor = ThreadPoolExecutor(max_workers=10)  # 并行线程池
+
+    def add_formation(self, formation_id: int, config: FormationConfig):
+        """添加编队（指定ID）"""
+        if formation_id in self.formations:
+            print(f"❌ 编队ID[{formation_id}] 已存在！")
+            return
+        sim = UUVFormationSimulator(config, formation_id)
+        self.formations[formation_id] = sim
+        print(f"✅ 编队[{formation_id}] 创建成功！")
+
+    def get_formation(self, formation_id: int) -> UUVFormationSimulator:
+        """根据ID获取编队"""
+        return self.formations.get(formation_id)
+
+    def parallel_step(self):
+        """【并行计算】所有编队同时执行仿真步"""
+        futures = []
+        for sim in self.formations.values():
+            # 提交到线程池并行执行
+            future = self.executor.submit(sim.step_simulation)
+            futures.append(future)
+        # 等待所有编队计算完成
+        for future in futures:
+            future.result()
+
+# ====================== 多编队可视化 ======================
+class MultiFormationVisualizer:
+    def __init__(self, manager: MultiFormationManager):
+        self.manager = manager
+        self.fig, self.ax = plt.subplots(figsize=(12, 12))
         self.ax.set_aspect('equal')
-        self.ax.set_title("UUV 集群编队仿真", fontsize=14)
+        self.ax.set_title("多编队UUV集群仿真（实时地理定位）", fontsize=14)
         self.ax.grid(True, alpha=0.3)
+        self.colors = ['#00FF00', '#FF6666', '#00BFFF', '#FFD700', '#FF69B4', '#32CD32']
+        self.global_ref_lon = None
+        self.global_ref_lat = None
 
     def update_frame(self, frame):
-        nodes = self.sim.step_simulation()
-        main = nodes[0]
-        xs, ys, cs = [], [], []
-
-        for n in nodes:
-            dx, dy = self.sim._geo2enu(n.lon, n.lat, main.lon, main.lat)
-            xs.append(dx)
-            ys.append(dy)
-            if n.id == 0:
-                cs.append('#00ff00')
-            elif n.is_leaving:
-                cs.append('#ff0000')
-            elif n.is_joining:
-                cs.append('#0000ff')
-            else:
-                cs.append('#ff6666')
-
+        self.manager.parallel_step()
         self.ax.clear()
         self.ax.set_aspect('equal')
         self.ax.grid(True, alpha=0.3)
@@ -468,22 +462,56 @@ class FormationVisualizer:
         self.ax.set_xlabel("东向 X (m)", fontsize=12)
         self.ax.set_ylabel("北向 Y (m)", fontsize=12)
 
-        self.ax.scatter(xs, ys, c=cs, s=100)
+        formation_ids = list(self.manager.formations.keys())
+        if not formation_ids:
+            return self.ax,
 
-        for n, x, y in zip(nodes, xs, ys):
-            t = f"ID{n.id}\n{n.heading:.0f}°\n{n.speed:.1f}"
-            if n.is_leaving:
-                t += "\n🚀脱离中"
-            if n.is_joining:
-                t += f"\n🔵加入中\n{n.join_progress:.0%}"
-            self.ax.annotate(t, (x, y), fontsize=8, color='white',
-                            bbox=dict(boxstyle="round", fc="black", alpha=0.7))
+        # ==============================================
+        # 🔥 修复点1：取【第一个编队主节点 实时坐标】为全局原点
+        # ==============================================
+        global_sim = self.manager.formations[formation_ids[0]]
+        global_main_node = global_sim.nodes[0]
+        self.global_ref_lon = global_main_node.lon
+        self.global_ref_lat = global_main_node.lat
 
-        info = (f"队形:{self.sim.config.formation_type}  总节点:{len(self.sim.nodes)}  "
-                f"脱离中:{len([n for n in self.sim.nodes if n.is_leaving])}  "
-                f"航向率:{self.sim.config.heading_rate:.1f}°/s")
-        self.ax.text(0.01, 0.98, info, transform=self.ax.transAxes, fontsize=10, verticalalignment='top',
-                    bbox=dict(boxstyle="round", facecolor='black', alpha=0.7), color='cyan')
+        # 遍历所有编队，计算【实时】全局偏移
+        for idx, (fid, sim) in enumerate(self.manager.formations.items()):
+            color = self.colors[idx % len(self.colors)]
+            # 当前编队的主节点（实时运动后的经纬度）
+            current_main_node = sim.nodes[0]
+            
+            # ==============================================
+            # 🔥 修复点2：实时计算 → 编队主节点 相对于全局原点的米级偏移
+            # ==============================================
+            offset_x, offset_y = sim._geo2enu(
+                current_main_node.lon, current_main_node.lat,
+                self.global_ref_lon, self.global_ref_lat
+            )
+
+            # 节点最终坐标 = 编队内相对坐标 + 编队全局实时偏移
+            xs, ys = [], []
+            for n in sim.nodes:
+                dx, dy = sim._geo2enu(n.lon, n.lat, current_main_node.lon, current_main_node.lat)
+                final_x = dx + offset_x
+                final_y = dy + offset_y
+                xs.append(final_x)
+                ys.append(final_y)
+
+            self.ax.scatter(xs, ys, c=color, s=100, label=f"编队{fid}")
+            
+            # 节点标注
+            for n, x, y in zip(sim.nodes, xs, ys):
+                t = f"F{fid}\nID{n.id}"
+                if n.is_leaving: t += "\n🚀脱离"
+                if n.is_joining: t += "\n🔵加入"
+                self.ax.annotate(t, (x, y), fontsize=7, color='white',
+                                bbox=dict(boxstyle="round", fc="black", alpha=0.7))
+
+        self.ax.legend(loc="upper right")
+        info = (f"编队数量：{len(self.manager.formations)} | "
+                f"编队1速度：2m/s | 编队2/3速度：4m/s")
+        self.ax.text(0.01, 0.98, info, transform=self.ax.transAxes, fontsize=10, 
+                    bbox=dict(boxstyle="round", fc="black", alpha=0.7), color='cyan')
         return self.ax,
 
     def start(self):
@@ -491,55 +519,87 @@ class FormationVisualizer:
         plt.tight_layout()
         plt.show()
 
-# ====================== 命令输入 ======================
-def input_worker(sim: UUVFormationSimulator):
-    print("\n===== 命令面板 =====")
-    print("1-5     : 切换队形")
-    print("add     : 增加1个节点")
-    print("add2    : 增加2个节点")
-    print("add3    : 增加3个节点")
-    print("remove  : 删除1个节点")
-    print("remove2 : 删除2个节点")
-    print("remove3 : 删除3个节点")
-    print("====================\n")
+# ====================== 多编队命令输入 ======================
+def input_worker(manager: MultiFormationManager):
+    print("\n===== 多编队命令面板 =====")
+    print("格式：编队ID:命令   |   all:命令 = 所有编队执行")
+    print("示例：1:1 → 编队1切直线 | 2:add → 编队2加节点 | all:2 → 所有编队切矩形")
+    print("命令：1-5队形 | add/add2/add3 | remove/remove2/remove3")
+    print("==========================\n")
+    
     while True:
         try:
             cmd = input(">> 输入命令：").strip().lower()
-            if cmd in "12345":
-                sim.switch_formation(cmd)
-            elif cmd == "add":
-                sim.add_multiple_nodes(1)
-            elif cmd == "add2":
-                sim.add_multiple_nodes(2)
-            elif cmd == "add3":
-                sim.add_multiple_nodes(3)
-            elif cmd == "remove":
-                sim.remove_random_node(1)
-            elif cmd == "remove2":
-                sim.remove_random_node(2)
-            elif cmd == "remove3":
-                sim.remove_random_node(3)
+            if ":" not in cmd:
+                print("❌ 格式错误！请用 编队ID:命令")
+                continue
+            
+            fid_str, cmd_str = cmd.split(":", 1)
+            # 执行命令
+            if fid_str == "all":
+                # 所有编队执行
+                for sim in manager.formations.values():
+                    exec_command(sim, cmd_str)
+            else:
+                # 单个编队执行
+                fid = int(fid_str)
+                sim = manager.get_formation(fid)
+                if not sim:
+                    print(f"❌ 编队ID[{fid}] 不存在！")
+                    continue
+                exec_command(sim, cmd_str)
         except Exception as e:
-            print(f"❌ 错误：{e}")
+            print(f"❌ 命令执行错误：{e}")
+
+def exec_command(sim: UUVFormationSimulator, cmd: str):
+    """执行编队命令"""
+    if cmd in "12345":
+        sim.switch_formation(cmd)
+    elif cmd == "add":
+        sim.add_multiple_nodes(1)
+    elif cmd == "add2":
+        sim.add_multiple_nodes(2)
+    elif cmd == "add3":
+        sim.add_multiple_nodes(3)
+    elif cmd == "remove":
+        sim.remove_random_node(1)
+    elif cmd == "remove2":
+        sim.remove_random_node(2)
+    elif cmd == "remove3":
+        sim.remove_random_node(3)
 
 # ====================== 主函数 ======================
 def main():
-    config = FormationConfig(
-        formation_type="line",
-        old_num=8,
-        node_num=6,
-        main_lon=120.0,
-        main_lat=30.0,
-        rel_distance=10.0,
-        init_speed=2.0,
-        init_heading=180.0,
-        heading_rate=1.0,
-        acceleration=0.0,
-        sim_step=0.1
+    # 1. 创建多编队管理器
+    manager = MultiFormationManager()
+
+    # 2. 创建多个编队（指定不同ID、位置、参数）
+    # 编队1：ID=1，直线队形，初始位置(120.0, 30.0)
+    config1 = FormationConfig(
+        formation_type="line", old_num=6, node_num=6, main_lon=120.0, main_lat=30.0,
+        rel_distance=10.0, init_speed=2.0, init_heading=135.0, heading_rate=1.0
     )
-    sim = UUVFormationSimulator(config)
-    viz = FormationVisualizer(sim)
-    threading.Thread(target=input_worker, args=(sim,), daemon=True).start()
+    manager.add_formation(1, config1)
+
+    # 编队2：ID=2，三角形队形，初始位置(120.002, 30.01)
+    config2 = FormationConfig(
+        formation_type="triangle", old_num=5, node_num=5, main_lon=120.0003, main_lat=30.0001,
+        rel_distance=10.0, init_speed=2.0, init_heading=45.0, heading_rate=0.0
+    )
+    manager.add_formation(2, config2)
+
+    # 编队3：ID=3，三角形队形，初始位置(120.002, 30.01)
+    config3 = FormationConfig(
+        formation_type="triangle", old_num=5, node_num=5, main_lon=120.0003, main_lat=30.0004,
+        rel_distance=10.0, init_speed=2.0, init_heading=45.0, heading_rate=0.0
+    )
+    manager.add_formation(3, config3)
+
+    # 3. 启动可视化
+    viz = MultiFormationVisualizer(manager)
+    # 4. 启动命令输入线程
+    threading.Thread(target=input_worker, args=(manager,), daemon=True).start()
+    # 5. 启动绘图
     viz.start()
 
 if __name__ == "__main__":
