@@ -228,6 +228,38 @@ class UUVFormationSimulator:
                 node.rel_x += (node.target_x - node.rel_x) * speed
                 node.rel_y += (node.target_y - node.rel_y) * speed
 
+    def _formation_keeping(self):
+        """队形保持：将因避碰偏离的节点拉回目标相对位置。
+        关键约束：每步最大修正量硬限制为0.4m，确保碰撞避免(1.0m/步)始终优先。
+        偏离越大回位越快，但不会与安全避碰对抗。"""
+        FK_MAX_STEP = 0.5  # 队形保持每步最大修正量（远低于避碰的1.0m/步）
+
+        for node in self.nodes[1:]:
+            if node.is_leaving or node.is_joining:
+                continue
+            dx = node.target_x - node.rel_x
+            dy = node.target_y - node.rel_y
+            dist = math.hypot(dx, dy)
+            if dist < 0.03:
+                continue  # 已在目标位置，无需调整
+
+            # 自适应回位速度（基于偏离距离），硬限制每步修正量
+            if dist < 1.5:
+                speed = 0.10  # 微调：慢速收敛（远低于避碰1.0m/步）
+            elif dist < 5.0:
+                speed = 0.10 + (dist - 1.5) * 0.02   # 0.10 → 0.17
+            elif dist < 10.0:
+                speed = 0.17 + (dist - 5.0) * 0.006  # 0.17 → 0.20
+            else:
+                speed = 0.20
+
+            correction = dist * speed
+            if correction > FK_MAX_STEP:
+                speed = FK_MAX_STEP / dist  # 缩放速度以满足硬限制
+
+            node.rel_x += dx * speed
+            node.rel_y += dy * speed
+
     def checkCollision1(self, positions: List[Point2D]) -> List[Point2D]:
         adjusted = [Point2D(p.x, p.y) for p in positions]
         iter_num = 0
@@ -361,6 +393,7 @@ class UUVFormationSimulator:
         if self.is_transition:
             self._transition_formation()
         self.apply_collision_avoidance()
+        self._formation_keeping()  # 队形保持：避碰后持续拉回目标位置
         w = math.radians(self.config.heading_rate)
 
         nodes_to_remove = []
