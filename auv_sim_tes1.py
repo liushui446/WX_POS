@@ -17,6 +17,7 @@ R_EARTH = 6378137.0
 WINDOW_RANGE = 150
 TRANSITION_SPEED = 0.08
 COLLISION_RADIUS = 4.0
+INTER_FORMATION_BUFFER = 2.0   # 跨编队额外安全距离（编队间比编队内更保守）
 MAX_COLLISION_ITER = 15
 MAX_ADJUST_STEP = 1.0
 ERROR_STABLE_THRESHOLD = 0.02
@@ -415,6 +416,8 @@ class MultiFormationManager:
     def __init__(self):
         self.formations: Dict[int, UUVFormationSimulator] = {}  # {编队ID: 仿真器}
         self.executor = ThreadPoolExecutor(max_workers=10)  # 并行线程池
+        self.inter_collision_count = 0       # 跨编队碰撞检测次数
+        self.collision_pairs: List = []      # 当前帧的跨编队碰撞对（用于可视化）
 
     def add_formation(self, formation_id: int, config: FormationConfig):
         """添加编队（指定ID）"""
@@ -430,7 +433,7 @@ class MultiFormationManager:
         return self.formations.get(formation_id)
 
     def parallel_step(self):
-        """【并行计算】所有编队同时执行仿真步"""
+        """【并行计算】所有编队同时执行仿真步，然后全局跨编队避碰"""
         futures = []
         for sim in self.formations.values():
             # 提交到线程池并行执行
@@ -439,6 +442,116 @@ class MultiFormationManager:
         # 等待所有编队计算完成
         for future in futures:
             future.result()
+        # 跨编队全局碰撞避免
+        self._apply_inter_formation_avoidance()
+
+    @staticmethod
+    def _global_collision_check(positions: List[Point2D],
+                                effective_radius: float = None) -> List[Point2D]:
+        """全局碰撞检测与分离（操作于全局ENU坐标）
+        Args:
+            positions: 节点位置列表
+            effective_radius: 有效避碰半径（直径），默认使用 COLLISION_RADIUS * 2
+        """
+        if effective_radius is None:
+            effective_radius = COLLISION_RADIUS * 2.0
+        adjusted = [Point2D(p.x, p.y) for p in positions]
+        iter_num = 0
+        has_collision = True
+        num = len(adjusted)
+        while has_collision and iter_num < MAX_COLLISION_ITER:
+            has_collision = False
+            pairs = []
+            for i in range(num):
+                for j in range(i + 1, num):
+                    d = (adjusted[i] - adjusted[j]).norm()
+                    if d < effective_radius:
+                        pairs.append((d, i, j))
+                        has_collision = True
+            if not has_collision:
+                break
+            pairs.sort(key=lambda x: x[0])
+            for d, i, j in pairs:
+                dir_vec = (adjusted[i] - adjusted[j]).normalized()
+                step = min((effective_radius - d) / 2, MAX_ADJUST_STEP)
+                adjusted[i] += dir_vec * step
+                adjusted[j] -= dir_vec * step
+            iter_num += 1
+        return adjusted
+
+    def _apply_inter_formation_avoidance(self):
+        """跨编队全局碰撞避免：收集全部节点到统一ENU坐标，检测并分离碰撞"""
+        all_sims = list(self.formations.values())
+        if len(all_sims) <= 1:
+            return
+
+        # 以第一个编队主节点为全局ENU参考原点
+        ref_sim = all_sims[0]
+        ref_lon = ref_sim.nodes[0].lon
+        ref_lat = ref_sim.nodes[0].lat
+
+        # 收集所有节点的全局ENU位置
+        node_entries = []  # (sim, node, is_leader)
+        positions = []
+        for sim in all_sims:
+            for i, node in enumerate(sim.nodes):
+                gx, gy = sim._geo2enu(node.lon, node.lat, ref_lon, ref_lat)
+                node_entries.append((sim, node, i == 0))
+                positions.append(Point2D(gx, gy))
+
+        # 检测跨编队碰撞对（用于可视化预警，使用更大的缓冲距离）
+        inter_effective_radius = COLLISION_RADIUS * 2.0 + INTER_FORMATION_BUFFER
+        self.collision_pairs = []
+        num = len(positions)
+        for i in range(num):
+            for j in range(i + 1, num):
+                sim_i, _, _ = node_entries[i]
+                sim_j, _, _ = node_entries[j]
+                if sim_i.formation_id == sim_j.formation_id:
+                    continue
+                d = (positions[i] - positions[j]).norm()
+                if d < inter_effective_radius:
+                    self.collision_pairs.append((positions[i], positions[j]))
+
+        if self.collision_pairs:
+            self.inter_collision_count += 1
+
+        # 运行全局碰撞分离（使用跨编队有效半径，更保守）
+        adjusted = self._global_collision_check(positions, inter_effective_radius)
+
+        # 将调整量写回各节点
+        for (sim, node, is_leader), old_pos, new_pos in zip(node_entries, positions, adjusted):
+            delta_x = new_pos.x - old_pos.x
+            delta_y = new_pos.y - old_pos.y
+
+            if abs(delta_x) < 1e-8 and abs(delta_y) < 1e-8:
+                continue
+
+            if is_leader:
+                # 领航节点：将调整后的ENU位置转回 lon/lat
+                new_lon, new_lat = sim._enu2geo(new_pos.x, new_pos.y, ref_lon, ref_lat)
+                node.lon = new_lon
+                node.lat = new_lat
+            else:
+                # 跟随节点：用逆旋转矩阵将全局ENU调整量转为 rel_x/rel_y 调整量
+                leader = sim.nodes[0]
+                hdg_rad = math.radians(leader.heading)
+                cos_h = math.cos(hdg_rad)
+                sin_h = math.sin(hdg_rad)
+                # R(-heading) * [delta_x, delta_y]^T
+                delta_rel_x = cos_h * delta_x + sin_h * delta_y
+                delta_rel_y = -sin_h * delta_x + cos_h * delta_y
+                node.rel_x += delta_rel_x
+                node.rel_y += delta_rel_y
+
+        # 重置所有领航节点的相对坐标（始终为原点）
+        for sim in all_sims:
+            sim.nodes[0].rel_x = 0.0
+            sim.nodes[0].rel_y = 0.0
+
+        # 重跑编队内避碰，修复因跨编队调整可能引入的编队内碰撞
+        for sim in all_sims:
+            sim.apply_collision_avoidance()
 
 # ====================== 多编队可视化 ======================
 class MultiFormationVisualizer:
@@ -509,9 +622,17 @@ class MultiFormationVisualizer:
 
         self.ax.legend(loc="upper right")
         info = (f"编队数量：{len(self.manager.formations)} | "
-                f"编队1速度：2m/s | 编队2/3速度：4m/s")
-        self.ax.text(0.01, 0.98, info, transform=self.ax.transAxes, fontsize=10, 
+                f"跨编队避碰次数：{self.manager.inter_collision_count}")
+        self.ax.text(0.01, 0.98, info, transform=self.ax.transAxes, fontsize=10,
                     bbox=dict(boxstyle="round", fc="black", alpha=0.7), color='cyan')
+
+        # 绘制跨编队碰撞预警线（红色虚线）
+        if self.manager.collision_pairs:
+            for p1, p2 in self.manager.collision_pairs:
+                self.ax.plot([p1.x, p2.x], [p1.y, p2.y], 'r--', linewidth=1.2, alpha=0.6)
+            self.ax.text(0.99, 0.98, f"⚠ 碰撞预警: {len(self.manager.collision_pairs)}对",
+                        transform=self.ax.transAxes, fontsize=10, ha='right',
+                        bbox=dict(boxstyle="round", fc="red", alpha=0.7), color='white')
         return self.ax,
 
     def start(self):
@@ -573,27 +694,37 @@ def main():
     # 1. 创建多编队管理器
     manager = MultiFormationManager()
 
-    # 2. 创建多个编队（指定不同ID、位置、参数）
-    # 编队1：ID=1，直线队形，初始位置(120.0, 30.0)
+    # 2. 创建多个编队（碰撞测试场景：编队2和编队3相向而行，编队1旋转穿插）
+    # 编队1：ID=1，直线队形，居中参考编队，缓慢旋转穿插
     config1 = FormationConfig(
         formation_type="line", old_num=6, node_num=6, main_lon=120.0, main_lat=30.0,
         rel_distance=10.0, init_speed=2.0, init_heading=135.0, heading_rate=1.0
     )
     manager.add_formation(1, config1)
 
-    # 编队2：ID=2，三角形队形，初始位置(120.002, 30.01)
+    # 编队2：ID=2，三角形队形，初始位置偏东，航向正西（270°），朝向编队3对撞
+    # 120.0006° ≈ 东偏58m，与编队3形成对撞航线
     config2 = FormationConfig(
-        formation_type="triangle", old_num=5, node_num=5, main_lon=120.0003, main_lat=30.0001,
-        rel_distance=10.0, init_speed=2.0, init_heading=45.0, heading_rate=0.0
+        formation_type="triangle", old_num=5, node_num=5,
+        main_lon=120.0006, main_lat=30.0001,
+        rel_distance=10.0, init_speed=3.0, init_heading=270.0, heading_rate=0.0
     )
     manager.add_formation(2, config2)
 
-    # 编队3：ID=3，三角形队形，初始位置(120.002, 30.01)
+    # 编队3：ID=3，矩形队形，初始位置偏西，航向正东（90°），朝向编队2对撞
+    # 119.9994° ≈ 西偏58m，与编队2形成对撞航线
     config3 = FormationConfig(
-        formation_type="triangle", old_num=5, node_num=5, main_lon=120.0003, main_lat=30.0004,
-        rel_distance=10.0, init_speed=2.0, init_heading=45.0, heading_rate=0.0
+        formation_type="rect", old_num=5, node_num=5,
+        main_lon=119.9994, main_lat=29.9999,
+        rel_distance=10.0, init_speed=3.0, init_heading=90.0, heading_rate=0.0
     )
     manager.add_formation(3, config3)
+
+    print("\n⚡ 碰撞测试场景：")
+    print("   编队1（绿色，6节点，直线）：中心旋转，穿插全场")
+    print("   编队2（红色，5节点，三角）：从东向西 ← 与编队3对撞")
+    print("   编队3（蓝色，5节点，矩形）：从西向东 → 与编队2对撞")
+    print("   预期：编队2和编队3节点接近时出现红色虚线预警并弹开\n")
 
     # 3. 启动可视化
     viz = MultiFormationVisualizer(manager)
